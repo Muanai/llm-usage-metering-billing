@@ -41,6 +41,16 @@ To ensure zero-risk correctness and respect capstone constraints:
 - **Database**: PostgreSQL (via Docker Compose) with automatic zero-configuration SQLite fallback for seamless single-command testing.
 - **Stripe Tooling**: Stripe Python SDK (`stripe`) + Stripe CLI (`stripe listen`, `stripe trigger`)
 
+### Zero-Config Startup Contract
+The evaluator must be able to boot the system on a clean machine with **one command and no Docker**. The startup path is:
+
+1. `run:` executes `uvicorn src.main:app --host 0.0.0.0 --port 8000` (see `capstone.yaml`).
+2. On FastAPI lifespan startup, the app **auto-runs Alembic migrations** (`alembic upgrade head`) against the configured database before serving traffic. No manual migration step.
+3. If `DATABASE_URL` is unset or points at Postgres that is unreachable, the app **falls back to a local SQLite file** (`./data/app.db`) and logs a clear warning. Postgres via `docker compose up` is the recommended path, never a hard requirement.
+4. `seed:` runs `python -m scripts.seed`, which is idempotent and safe to re-run.
+
+This guarantees Layer 1 (submission pack) passes even on a machine with no Docker and no Postgres.
+
 ### Layered Architecture Structure
 
 ```text
@@ -295,6 +305,42 @@ The global exception handlers in `src/api/error_handlers.py` guarantee this shap
 
 ---
 
+### 5.8 Seed Fixtures, Stripe Provisioning & Test Isolation
+
+#### 5.8.1 Fixed Tenant Fixtures (Seed Contract)
+`python -m scripts.seed` is idempotent and creates a **fixed, documented set of tenants with stable IDs**. Evaluators and tests depend on these exact IDs, so they are part of the contract:
+
+| Tenant ID | Plan | Subscription status | Seeded usage | Purpose |
+|---|---|---|---|---|
+| `tenant_free_fresh` | free | active | 0 API calls, 0 tokens | Clean baseline; PROBE 1 (idempotency) |
+| `tenant_free_boundary` | free | active | 999 API calls | PROBE 2 (boundary: next call → 200, then 429) |
+| `tenant_pro_active` | pro | active | 150 API calls, 125k tokens | PROBE 5 (pricing rollup), PROBE 3 target |
+| `tenant_pro_past_due` | pro | past_due | 0 | 402 path (account health before quota) |
+
+The seeder also upserts the two `plans` rows (`free`, `pro`) with their pinned limits and prices. Re-running the seeder resets these tenants to their documented baseline state (delete-then-insert for their usage events) so probes are reproducible.
+
+#### 5.8.2 Stripe Test-Mode Provisioning
+Checkout requires a real Stripe test `price_id` for the Pro plan, which is account-specific. The seeder **auto-provisions** it:
+
+1. On run, the seeder looks up an existing test price by a stable lookup key (`flyrank_pro_monthly`).
+2. If absent, it creates the product + recurring price via the Stripe API (test mode) and stores the resulting `price_id` in the `plans` row.
+3. If `STRIPE_SECRET_KEY` is unset, the seeder skips Stripe provisioning, logs a warning, and leaves `stripe_price_id` null — the API still boots and all non-Stripe probes still pass.
+
+**Documented CLI fallback** (in README, for when auto-provisioning is undesirable):
+```
+stripe prices create --unit-amount 2900 --currency usd \
+  --recurring interval=month --lookup-key flyrank_pro_monthly
+```
+The resulting `price_...` ID is pasted into `.env` as `STRIPE_PRO_PRICE_ID`.
+
+#### 5.8.3 Test Isolation
+Tests never touch the development or evaluator database, and never start the scheduler:
+
+- **Isolated database**: the test suite sets `DATABASE_URL` to a dedicated SQLite file (or a per-run temp file) created fresh at session start and torn down at the end. Each test runs inside a transaction that is rolled back, so tests are order-independent and deterministic.
+- **Direct worker invocation**: worker tests call `run_once()` directly. The APScheduler job is never started under test (`WORKER_ENABLED=false` in the test environment), so there is no background timer racing the assertions.
+- **No live Stripe calls in unit tests**: webhook tests construct signed payloads locally with the test `whsec_` secret and post them to the endpoint; they do not call the Stripe API. Only the optional end-to-end Checkout walkthrough (documented in README, not part of `test:`) touches Stripe's servers.
+
+---
 ## 6. API Interface Contracts
 
 ### 1. `POST /api/v1/generate` (Billable Endpoint)
