@@ -15,7 +15,7 @@ Each section below has a **Claim**, a **How to reproduce** command, and a **Proo
 - **Reproduce:**
   ```bash
   curl -s -X POST http://localhost:8000/api/v1/generate \
-    -H "X-Tenant-ID: tenant_free_fresh" \
+    -H "X-Tenant-ID: tenant_clean" \
     -H "Idempotency-Key: demo-key-1" \
     -H "Content-Type: application/json" \
     -d '{"model":"gemini-1.5-pro","prompt":"hi","simulated_tokens":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_tokens":0}}'
@@ -46,7 +46,7 @@ Each section below has a **Claim**, a **How to reproduce** command, and a **Proo
 - **Claim:** Monthly usage rolls up into a cost figure; cached input is discounted, reasoning tokens are billed as output; totals match the pinned constants exactly.
 - **Reproduce:**
   ```bash
-  curl -s http://localhost:8000/api/v1/tenants/tenant_pro_active/usage
+  curl -s http://localhost:8000/api/v1/tenants/tenant_pricing_demo/usage
   ```
 - **Proof:**
   ```
@@ -60,10 +60,10 @@ Each section below has a **Claim**, a **How to reproduce** command, and a **Proo
   ```bash
   curl -s -X POST http://localhost:8000/api/v1/billing/checkout \
     -H "Content-Type: application/json" \
-    -d '{"tenant_id":"tenant_free_fresh","plan_id":"pro"}'
+    -d '{"tenant_id":"tenant_checkout_demo","plan_id":"pro"}'
   # open checkout_url, pay with 4242 4242 4242 4242
   # then:
-  curl -s http://localhost:8000/api/v1/tenants/tenant_free_fresh/usage
+  curl -s http://localhost:8000/api/v1/tenants/tenant_checkout_demo/usage
   ```
 - **Proof:**
   ```

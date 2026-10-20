@@ -16,7 +16,7 @@
 
 - Stripe test mode only with test cards; no real credit card or live money ever.
 - All monetary calculations and persistence must use integer micro-cents ($1\text{ USD} = 100\text{ cents} = 100,000,000\text{ micro-cents}$); no float for currency.
-- Single billable action produces exactly one usage event in `usage_events` table (`event_type: "generation"`).
+- Single billable action produces exactly one usage event in `usage_events` table (`event_type: "api_call"`).
 - Idempotency uniqueness enforced per tenant: `UNIQUE(tenant_id, idempotency_key)`.
 - All API errors must follow the uniform envelope: `{"error": {"code": "...", "message": "...", "details": {...}}}`.
 - Single command `run:` in `capstone.yaml` must boot both API and background worker with zero required Docker dependencies (auto-SQLite fallback).
@@ -27,7 +27,7 @@
 ## Review Focus
 
 1. **Concurrent requests at quota boundary**: Two simultaneous requests at 999/1000 calls $\rightarrow$ row locking serializes evaluation so the second receives `429 Too Many Requests`, preventing quota overshoot. (Tested in Task 5).
-2. **Idempotency key payload mismatch**: Same key resent with a different payload or path $\rightarrow$ rejected with `400 Bad Request` (`code: "idempotency_conflict"`), preserving initial result. (Tested in Task 4).
+2. **Idempotency key payload mismatch**: Same key resent with a different payload or path $\rightarrow$ rejected with `400 Bad Request` (`code: "idempotency_key_reuse"`), preserving initial result. (Tested in Task 4).
 3. **Out-of-order Stripe webhooks**: `customer.subscription.updated` arrives before `checkout.session.completed` $\rightarrow$ upsert pattern with timestamp guard prevents stale overwrites and missing state. (Tested in Task 7).
 4. **Sub-cent cumulative rounding**: Multiple calls accumulating fractional cents $\rightarrow$ micro-cents summed without intermediate rounding, rounded at summary boundary using `ROUND_HALF_UP`. (Tested in Task 3 & 6).
 5. **Missing mandatory headers**: Requests without `Idempotency-Key` or `X-Tenant-ID` $\rightarrow$ clean `400 Bad Request` with structured error envelope, never a 500 error. (Tested in Task 6).
@@ -68,6 +68,10 @@ llm-usage-metering-billing/
 │   │   ├── __init__.py
 │   │   └── reconciliation.py # Asyncio loop & standalone runner (Stripe sync + quota alerts)
 │   └── main.py               # FastAPI app, lifespan setup, CORS, router inclusion
+├── migrations/
+│   ├── env.py                # Alembic async environment
+│   └── versions/             # Schema migration revisions (initial + later)
+├── alembic.ini               # Alembic configuration
 ├── scripts/
 │   └── seed.py               # Deterministic fixture seeder (boundary, past_due, demo)
 ├── tests/
@@ -104,7 +108,7 @@ llm-usage-metering-billing/
 - Create: `tests/test_config.py`
 
 **Interfaces:**
-- Produces: `config.settings.Settings` instance `settings` containing `DATABASE_URL`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRO_PRICE_ID`, `ENVIRONMENT`.
+- Produces: `config.settings.Settings` instance `settings` containing `DATABASE_URL`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRO_PRICE_ID`, `WORKER_ENABLED` (default false), `WORKER_INTERVAL_SECONDS` (default 900), `ENVIRONMENT`.
 - Produces: `config/pricing.json` with pinned rates in micro-cents ($1\text{ USD} = 100{,}000{,}000\text{ micro-cents}$).
 
 - [ ] **Step 1: Write the failing test for configuration loading**
@@ -185,11 +189,14 @@ git commit -m "feat: add environment configuration and pinned pricing constants"
 - Create: `src/db/models.py`
 - Create: `tests/conftest.py`
 - Create: `tests/test_db_models.py`
+- Create: `alembic.ini`
+- Create: `migrations/env.py`
+- Create: `migrations/versions/0001_initial.py`
 
 **Interfaces:**
 - Produces: `src.db.models.Base`, `Tenant`, `Plan`, `Subscription`, `UsageEvent`, `IdempotencyKey`, `WebhookEvent`.
 - Produces: `src.db.session.get_db() -> AsyncGenerator[AsyncSession, None]`.
-- Produces: `src.db.session.init_db()` to create tables on startup if not present.
+- Produces: `src.db.session.init_db()` (test/utility table creation) and `run_migrations()` (runs `alembic upgrade head`).
 
 - [ ] **Step 1: Write failing tests for model creation and DB session**
 
@@ -223,11 +230,13 @@ Expected: FAIL (No module named 'src.db.models')
    - `Tenant`: `id`, `name`, `email`, `created_at`, `updated_at`.
    - `Plan`: `id`, `name`, `monthly_api_limit`, `monthly_token_limit`, `base_price_cents`, `stripe_price_id`.
    - `Subscription`: `id`, `tenant_id` (FK), `plan_id` (FK), `stripe_customer_id`, `stripe_subscription_id`, `status`, `current_period_start`, `current_period_end`, `stripe_last_event_created_at`.
-   - `UsageEvent`: `id`, `tenant_id` (FK), `event_type="generation"`, `api_calls=1`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `cost_micro_cents`, `idempotency_key`, `created_at`.
+   - `UsageEvent`: `id`, `tenant_id` (FK), `event_type="api_call"`, `api_calls=1`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `cost_micro_cents`, `idempotency_key`, `created_at`.
    - `IdempotencyKey`: `id`, `tenant_id` (FK), `idempotency_key`, `request_path`, `request_hash`, `response_status_code`, `response_body`, `created_at`, `expires_at`. Table constraint: `UniqueConstraint('tenant_id', 'idempotency_key')`.
    - `WebhookEvent`: `stripe_event_id` (PK), `event_type`, `status`, `processed_at`.
 2. Implement `src/db/session.py` with dynamic async engine supporting SQLite fallback (`sqlite+aiosqlite:///./data/app.db`) and PostgreSQL (`postgresql+asyncpg://...`).
-3. Setup `tests/conftest.py` fixture `db_session` using in-memory or `./data/test.db` with auto-migration/table creation and rollback.
+3. Configure Alembic for async SQLAlchemy: `alembic.ini` points at the settings URL, `migrations/env.py` imports `Base.metadata`, and `migrations/versions/0001_initial.py` creates all six tables with the documented indexes and the `UNIQUE (tenant_id, idempotency_key)` constraint.
+4. Add `run_migrations()` (invoking `alembic upgrade head`); the FastAPI lifespan in Task 6 calls it before serving traffic, so `run:` needs no manual migration step.
+5. Setup `tests/conftest.py` fixture `db_session` using a dedicated `./data/test.db` created by `Base.metadata.create_all` (fast, no Alembic) with transaction rollback per test.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -255,7 +264,7 @@ git commit -m "feat: implement database session factory and multi-tenant domain 
 - Produces: `TokenUsage(input_tokens, cached_input_tokens, output_tokens, reasoning_tokens)`.
 - Produces: `calculate_token_cost(usage: TokenUsage) -> CostBreakdown`.
 - Produces: `round_micro_cents_to_cents(micro_cents: int) -> int` (using `ROUND_HALF_UP`).
-- Produces: `calculate_monthly_rollup(events: list[UsageEvent], base_subscription_cents: int) -> RollupSummary`.
+- Produces: `calculate_monthly_rollup(total_api_calls: int, token_micro_cents: int, base_price_cents: int) -> RollupSummary`, where `RollupSummary` exposes `total_micro_cents: int`, `total_cents: int` (rounded once, half-up, from the summed total), and `formatted_total: str`.
 
 - [ ] **Step 1: Write failing tests for token pricing math and rounding rules**
 
@@ -303,6 +312,11 @@ def test_api_calls_have_zero_marginal_cost():
     )
     assert summary.total_cents == 2951
     assert summary.formatted_total == "$29.51"
+
+def test_rollup_rounds_once_on_total_not_per_component():
+    # 0.6 + 0.6 cents: rounding each part first would wrongly yield 2 cents
+    summary = calculate_monthly_rollup(total_api_calls=0, token_micro_cents=1_200_000, base_price_cents=0)
+    assert summary.total_cents == 1
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -370,30 +384,10 @@ async def test_idempotency_first_seen_and_replay(db_session):
     assert res.status == IdempotencyStatus.NEW
 
     # 2. Save response
-    await save_idempotency_response(db_session, tenant_id, key, 200, '{"result": "ok"}')
-
-    # 3. Second seen with same key, path, and hash -> Replay
-    res2 = await check_or_reserve_idempotency(db_session, tenant_id, key, path, hash1)
-    assert res2.status == IdempotencyStatus.REPLAY
-    assert res2.cached_status_code == 200
-    assert res2.cached_response_body == '{"result": "ok"}'
-
-@pytest.mark.asyncio
-async def test_idempotency_payload_mismatch_returns_conflict(db_session):
-    tenant_id = "tenant_idemp"
-    key = "key_conflict"
-    path = "/api/v1/generate"
-    hash1 = compute_payload_hash({"prompt": "hello"})
-    hash2 = compute_payload_hash({"prompt": "different prompt"})
-
-    await check_or_reserve_idempotency(db_session, tenant_id, key, path, hash1)
-    await save_idempotency_response(db_session, tenant_id, key, 200, '{"result": "ok"}')
-
-    # Resend same key with different payload hash
-    res = await check_or_reserve_idempotency(db_session, tenant_id, key, path, hash2)
+    await save_idempotency_response(db_session, tenant_id, key, 200, '{"ok": true}')
+    res = await check_or_reserve_idempotency(db_session, tenant_id, key, "/api/v1/billing/checkout", h)
     assert res.status == IdempotencyStatus.CONFLICT
 ```
-
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_idempotency.py -v`
@@ -404,8 +398,7 @@ Expected: FAIL (No module named 'src.core.idempotency')
 1. Compute SHA-256 hash of normalized JSON / bytes.
 2. Query `IdempotencyKey` by `(tenant_id, idempotency_key)`.
 3. If found:
-   - Check if `request_path == current_path` and `request_hash == current_hash`.
-   - If mismatch: return status `CONFLICT`.
+   - If `request_path` differs from the stored path OR `request_hash` differs: return status `CONFLICT`, surfaced as `400` with code `idempotency_key_reuse`. A key is scoped to one execution per tenant across all endpoints, so cross-endpoint reuse is a conflict, never a replay.
    - If match: return status `REPLAY` with stored `response_status_code` and `response_body`.
 4. If not found: return status `NEW`.
 5. Implement `save_idempotency_response` to persist the execution result.
@@ -434,6 +427,7 @@ git commit -m "feat: implement atomic idempotency key deduplication and conflict
 - Consumes: `src.db.models.Tenant`, `Subscription`, `Plan`, `UsageEvent`.
 - Produces: `check_tenant_quota(db, tenant_id: str, requested_calls: int = 1, requested_tokens: int = 0) -> QuotaCheckResult`.
 - Produces: `QuotaDecision` enum (`ALLOWED`, `QUOTA_EXCEEDED` [429], `PAYMENT_REQUIRED` [402]).
+- Produces: `resolve_usage_window(plan_id: str, subscription: Subscription) -> tuple[datetime, datetime]` (Free = UTC calendar month; Pro = Stripe billing period).
 
 - [ ] **Step 1: Write failing tests for 402/429 precedence and boundary conditions**
 
@@ -473,7 +467,7 @@ async def test_exact_quota_boundary_999_to_1000_and_1001(db_session):
     db_session.add_all([plan, tenant, sub])
     # Seed 999 usage events
     event = UsageEvent(
-        tenant_id="tenant_boundary", event_type="generation",
+        tenant_id="tenant_boundary", event_type="api_call",
         api_calls=999, input_tokens=1000, cached_input_tokens=0,
         output_tokens=500, reasoning_tokens=0, cost_micro_cents=500000,
         idempotency_key="seed_999"
@@ -487,7 +481,7 @@ async def test_exact_quota_boundary_999_to_1000_and_1001(db_session):
 
     # Now add the 1000th call to DB
     e1000 = UsageEvent(
-        tenant_id="tenant_boundary", event_type="generation", api_calls=1,
+        tenant_id="tenant_boundary", event_type="api_call", api_calls=1,
         input_tokens=0, cached_input_tokens=0, output_tokens=0, reasoning_tokens=0,
         cost_micro_cents=0, idempotency_key="call_1000"
     )
@@ -499,6 +493,14 @@ async def test_exact_quota_boundary_999_to_1000_and_1001(db_session):
     assert d2.status == QuotaDecision.QUOTA_EXCEEDED
     assert d2.http_status == 429
     assert d2.retry_after_seconds > 0
+
+@pytest.mark.asyncio
+async def test_free_tenant_usage_window_is_calendar_month(db_session):
+    from src.core.quota import resolve_usage_window
+    sub = Subscription(tenant_id="tenant_window", plan_id="free", status="active")
+    start, end = resolve_usage_window("free", sub)
+    assert start.day == 1 and start.hour == 0 and start.minute == 0 and start.second == 0
+    assert end > start
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -511,7 +513,7 @@ Expected: FAIL (No module named 'src.core.quota')
 1. Lock tenant row via `select(Tenant).where(Tenant.id == tenant_id).with_for_update()`.
 2. Fetch `Subscription` and `Plan`.
 3. Check status: if `status in ["past_due", "unpaid", "canceled", "incomplete"]`, return `PAYMENT_REQUIRED` (402).
-4. Aggregate usage in current cycle: `SUM(api_calls)` and `SUM(total_tokens)`.
+4. Resolve the window with `resolve_usage_window`: Free uses the UTC calendar month, Pro uses `[current_period_start, current_period_end)`. Aggregate only events inside that window: `SUM(api_calls)` and the four token columns.
 5. Compare `current_calls + requested_calls <= plan.monthly_api_limit` and tokens.
 6. If exceeded, return `QUOTA_EXCEEDED` (429) with calculated `Retry-After` seconds until `current_period_end`.
 7. Otherwise, return `ALLOWED` (200).
@@ -565,7 +567,15 @@ async def test_generate_missing_headers_returns_clean_400(db_session):
         assert res.status_code == 400
         data = res.json()
         assert "error" in data
-        assert data["error"]["code"] == "missing_header"
+        assert data["error"]["code"] == "missing_tenant_id"
+
+        res2 = await client.post(
+            "/api/v1/generate",
+            json={"prompt": "hi"},
+            headers={"X-Tenant-ID": "tenant_api_test"},
+        )
+        assert res2.status_code == 400
+        assert res2.json()["error"]["code"] == "missing_idempotency_key"
 
 @pytest.mark.asyncio
 async def test_generate_billable_call_and_idempotent_replay(db_session):
@@ -625,7 +635,7 @@ Expected: FAIL (No module named 'src.main')
    - Computes token cost via `calculator`.
    - Saves idempotency snapshot and commits.
 4. Create `src/api/v1/usage.py` performing the monthly rollup query and returning exact JSON.
-5. Create `src/main.py` initializing FastAPI, routers, and CORS.
+5. Create `src/main.py` initializing FastAPI, routers, and CORS. The lifespan calls `run_migrations()` first so `run:` needs no manual migration step.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -663,6 +673,7 @@ git commit -m "feat: implement generate and usage endpoints with uniform error e
 import pytest
 from unittest.mock import patch, MagicMock
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import select
 from src.main import app
 from src.db.models import Tenant, Plan, Subscription, WebhookEvent
 
@@ -675,7 +686,7 @@ async def test_forged_webhook_signature_returns_400(db_session):
             headers={"Stripe-Signature": "t=123,v1=invalid_signature"}
         )
         assert res.status_code == 400
-        assert res.json()["error"]["code"] == "invalid_webhook_signature"
+        assert res.json()["error"]["code"] == "invalid_signature"
 
 @pytest.mark.asyncio
 async def test_webhook_checkout_completed_flips_free_to_pro_and_replay_ignored(db_session):
@@ -717,6 +728,34 @@ async def test_webhook_checkout_completed_flips_free_to_pro_and_replay_ignored(d
             assert r2.status_code == 200
             assert r2.json()["status"] == "ignored"
             assert r2.json()["reason"] == "duplicate_event"
+
+@pytest.mark.asyncio
+async def test_subscription_updated_before_checkout_is_upserted(db_session):
+    plan_pro = Plan(id="pro", name="Pro", monthly_api_limit=50000, monthly_token_limit=5000000, base_price_cents=2900, stripe_price_id="price_pro")
+    tenant = Tenant(id="tenant_ooo", name="OOO Org", email="ooo@example.com")
+    db_session.add_all([plan_pro, tenant])
+    await db_session.commit()
+
+    mock_event = {
+        "id": "evt_ooo_001",
+        "type": "customer.subscription.updated",
+        "created": 1730000100,
+        "data": {"object": {
+            "id": "sub_ooo", "customer": "cus_ooo", "status": "active",
+            "current_period_start": 1730000000, "current_period_end": 1732592000,
+            "items": {"data": [{"price": {"id": "price_pro"}}]},
+        }},
+    }
+    with patch("stripe.Webhook.construct_event", return_value=mock_event):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            r = await client.post("/api/v1/billing/webhooks/stripe", json={}, headers={"Stripe-Signature": "t=1,v1=x"})
+            assert r.status_code == 200
+
+    res = await db_session.execute(select(Subscription).where(Subscription.tenant_id == "tenant_ooo"))
+    sub = res.scalar_one()
+    assert sub.plan_id == "pro"
+    assert sub.status == "active"
+    assert sub.stripe_subscription_id == "sub_ooo"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -732,12 +771,14 @@ Expected: FAIL (Cannot import name 'billing' or endpoint not found)
 2. Implement `POST /api/v1/billing/webhooks/stripe`:
    - Reads `await request.body()` for raw payload bytes.
    - Verifies signature with `stripe.Webhook.construct_event`.
-   - On error: raises `HTTPException(status_code=400, detail={"code": "invalid_webhook_signature", ...})`.
+   - On error: raises `HTTPException(status_code=400, detail={"code": "invalid_signature", ...})`.
    - Deduplication: checks `WebhookEvent` table for `event["id"]`. If found, returns `{"status": "ignored", "reason": "duplicate_event"}`.
-   - Dispatches:
-     - `checkout.session.completed`: updates tenant subscription to `plan_id = "pro"`, `status = "active"`.
-     - `customer.subscription.updated`: updates status and cycle window.
-     - `customer.subscription.deleted`: downgrades to `free`.
+   - Out-of-order guard: if the subscription row has `stripe_last_event_created_at` and `event["created"]` is older than it, acknowledge `200` and skip application.
+   - Dispatches (upsert semantics; order-independent):
+     - `checkout.session.completed`: upsert subscription to the plan resolved from the session price ID (fallback `metadata.plan_id`), `status = "active"`, recording Stripe customer/subscription IDs.
+     - `customer.subscription.updated`: upsert the subscription (create it if it does not exist yet) resolving the plan from the event price ID, and update status + cycle window.
+     - `customer.subscription.deleted`: downgrade to `free` and clear Stripe subscription IDs.
+   - Persist the applied event's `created` value to `stripe_last_event_created_at`.
    - Records `WebhookEvent(stripe_event_id=event["id"], status="processed")` and commits.
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -764,7 +805,7 @@ git commit -m "feat: implement Stripe checkout and signature-verified webhook ha
 
 **Interfaces:**
 - Produces: `run_reconciliation_once(db_session, stripe_client=None) -> ReconciliationReport`.
-- Produces: `run_reconciliation_loop(interval_seconds: int = 60)` started in FastAPI lifespan.
+- Produces: `run_reconciliation_loop(interval_seconds: int = settings.WORKER_INTERVAL_SECONDS)` started in the FastAPI lifespan only when `settings.WORKER_ENABLED` is true.
 - Detects: Out-of-sync subscriptions and updates DB.
 - Detects: Quota usage $\ge 80\%$ (warning alert) and $\ge 100\%$ (critical alert).
 - Includes: Exponential backoff retry logic on Stripe API network failure.
@@ -804,7 +845,7 @@ async def test_worker_detects_quota_alert_thresholds(db_session):
     tenant = Tenant(id="tenant_alert", name="Alert Org", email="alert@example.com")
     sub = Subscription(tenant_id="tenant_alert", plan_id="free", status="active")
     event = UsageEvent(
-        tenant_id="tenant_alert", event_type="generation", api_calls=850,
+        tenant_id="tenant_alert", event_type="api_call", api_calls=850,
         input_tokens=0, cached_input_tokens=0, output_tokens=0, reasoning_tokens=0,
         cost_micro_cents=0, idempotency_key="alert_850"
     )
@@ -831,7 +872,8 @@ Expected: FAIL (No module named 'src.workers.reconciliation')
    - If status differs, reconciles local DB and logs notice.
    - Calculates monthly usage for all active tenants; if $\ge 80\%$, logs warning; if $\ge 100\%$, logs critical alert.
    - Exposes `run_reconciliation_loop()` for lifespan and `run_reconciliation_once()` for tests.
-2. In `src/main.py`, start `asyncio.create_task(run_reconciliation_loop())` during lifespan if `ENVIRONMENT != "testing"`.
+2. In `src/main.py`, start `asyncio.create_task(run_reconciliation_loop())` during lifespan only if `settings.WORKER_ENABLED` (default false, so tests are deterministic).
+3. Guard a run with a database advisory lock so a standalone `python -m src.workers.reconciliation` and the embedded loop cannot execute concurrently.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -858,7 +900,7 @@ git commit -m "feat: implement background reconciliation worker and quota thresh
 - Create: `tests/test_seed.py`
 
 **Interfaces:**
-- Produces: `python scripts/seed.py` creating exact deterministic test fixtures:
+- Produces: `python -m scripts.seed` creating exact deterministic test fixtures:
   - `tenant_free_boundary` (999 calls seeded).
   - `tenant_pro_past_due` (status: `past_due`).
   - `tenant_checkout_demo` (clean Free tenant).
@@ -899,7 +941,7 @@ Expected: FAIL (No module named 'scripts.seed')
 
 - [ ] **Step 3: Implement `scripts/seed.py`, `docker-compose.yml`, `capstone.yaml`, and `README.md`**
 
-1. Create `scripts/seed.py` inserting plans and the 5 fixtures. If `STRIPE_SECRET_KEY` is available, optionally auto-provision Pro plan price ID in Stripe test mode.
+1. Create `scripts/seed.py` inserting plans and the 5 fixtures. It is idempotent: it upserts plans/tenants and resets each fixture tenant's usage events to the documented baseline. If `STRIPE_SECRET_KEY` is set, it looks up a test price by key `flyrank_pro_monthly` and creates the product + recurring $29/mo price only when absent, then stores the returned `price_id` on the `pro` plan. If the key is unset it logs a warning and leaves `stripe_price_id` null (non-Stripe probes still pass). Document the CLI fallback in the README: `stripe prices create --unit-amount 2900 --currency usd --recurring interval=month --lookup-key flyrank_pro_monthly`.
 2. Create `docker-compose.yml` for PostgreSQL:
    ```yaml
    version: '3.8'
@@ -916,7 +958,7 @@ Expected: FAIL (No module named 'scripts.seed')
 3. Create `capstone.yaml`:
    ```yaml
    run: uvicorn src.main:app --host 0.0.0.0 --port 8000
-   seed: python scripts/seed.py
+   seed: python -m scripts.seed
    test: pytest -v
    base_url: http://localhost:8000
    endpoints:

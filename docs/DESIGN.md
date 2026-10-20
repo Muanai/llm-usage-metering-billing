@@ -47,4 +47,4 @@ This capstone builds a backend service addressing all three: idempotent usage me
 - **Billing windows**: Free tenants roll up on the UTC calendar month; Pro tenants roll up on the Stripe billing period.
 - **Webhooks**: upsert semantics (order-independent), signature-verified, deduplicated by `stripe_event_id`.
 - **Errors**: one envelope everywhere — `{"error": {"code", "message", "details"}}`.
-- **Worker**: hybrid — runnable standalone (`python -m src.workers.reconciliation`) and optionally self-scheduling via APScheduler in the FastAPI lifespan.
+- **Worker**: hybrid — runnable standalone (`python -m src.workers.reconciliation`) and optionally self-scheduling via an `asyncio` loop in the FastAPI lifespan, gated by `WORKER_ENABLED`.

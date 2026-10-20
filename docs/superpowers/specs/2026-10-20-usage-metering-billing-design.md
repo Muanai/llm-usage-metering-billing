@@ -135,8 +135,8 @@ erDiagram
     USAGE_EVENTS {
         string id PK "UUID"
         string tenant_id FK "Index (tenant_id, created_at)"
-        string event_type "'api_call' or 'ai_tokens'"
-        int quantity "Total count"
+''api_call' or 'ai_tokens'"
+        int api_calls "1 per billable request"
         int input_tokens "Standard input tokens"
         int cached_input_tokens "Cached input tokens"
         int output_tokens "Standard output tokens"
@@ -160,7 +160,7 @@ erDiagram
 
     WEBHOOK_EVENTS {
         string stripe_event_id PK "e.g., 'evt_...'"
-        string event_type "e.g., 'checkout.session.completed'"
+'e.g., 'checkout.session.completed'"
         string status "'processed', 'failed', 'ignored'"
         datetime processed_at
     }
@@ -183,16 +183,16 @@ erDiagram
      - Save response snapshot and status into `IDEMPOTENCY_KEYS`.
      - Return the freshly generated response.
 - **Concurrency Safety**: Enforced via DB unique constraint `UNIQUE (tenant_id, idempotency_key)` and row-level locking to prevent race conditions during simultaneous identical requests.
-- **Key Scope**: Idempotency keys are **globally unique per tenant across every endpoint**, not per route — one key = one execution from the client. The constraint is `UNIQUE (tenant_id, idempotency_key)`; `request_path` is stored for diagnostics only and is not part of the uniqueness key.
+- **Key Scope**: Idempotency keys are **globally unique per tenant across every endpoint**, not per route — one key = one execution from the client. The constraint is `UNIQUE (tenant_id, idempotency_key)`; `request_path` is stored for diagnostics only and is not part of the uniqueness key. Reusing a key against a different endpoint or with a different payload is rejected with `400` and code `idempotency_key_reuse`; it is never silently replayed as another endpoint's response.
 
 ### 5.1b Event Granularity (One Request = One Event)
 A single `POST /api/v1/generate` call produces **exactly one** `USAGE_EVENTS` row - never two. That row carries both dimensions of the request:
 
-- `event_type = "api_call"`, `quantity = 1` (drives the API-call quota counter), **and**
+- `event_type = "api_call"`, `api_calls = 1` (drives the API-call quota counter), **and**
 - the four token fields populated (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`) plus the computed `cost_micro_cents` (drive the token quota counter and cost rollup).
 
 Consequences:
-- The API-call rollup counts rows where `event_type = "api_call"` (equivalently, sums `quantity`).
+- The API-call rollup counts rows where `event_type = "api_call"` (equivalently, sums `api_calls`).
 - The token rollup sums the token columns across those same rows; it does not require a separate `ai_tokens` event.
 - Idempotency replay returns the single stored response for the single stored event - there is no partial-event state to reconcile.
 - `event_type = "ai_tokens"` remains a valid enum value for a future token-only endpoint, but the core `/generate` flow does not emit it.
@@ -256,8 +256,8 @@ Consequences:
   3. **Resilience**: Implements exponential backoff retries on network failures and logs failure alerts if retries are exhausted.
 - **Execution Model (Hybrid)**: The worker is both runnable standalone and self-scheduling:
   - **Standalone (A)**: `python -m src.workers.reconciliation` runs one full pass and exits, so it can be driven by cron, a supervisor, or the evaluator directly. This is the canonical entry point referenced by `capstone.yaml`.
-  - **Embedded (B)**: When `WORKER_ENABLED=true`, the FastAPI lifespan starts an APScheduler job that invokes the same pass on a fixed interval (default 15 min), so a single `run:` command boots both API and worker.
-  - Both paths call the identical `run_once()` function; there is no duplicated logic. The embedded scheduler is disabled by default in tests to keep them deterministic.
+  - **Embedded (B)**: When `WORKER_ENABLED=true`, the FastAPI lifespan starts an `asyncio.create_task` loop that invokes the same pass every `WORKER_INTERVAL_SECONDS` (default 900 s / 15 min), so a single `run:` command boots both API and worker with no extra dependency.
+  - Both paths call the identical `run_once()` function; there is no duplicated logic. A database advisory lock makes a standalone run and the embedded loop mutually exclusive, so an overlapping invocation cannot double-alert. The embedded loop is disabled by default in tests (`WORKER_ENABLED=false`) to keep them deterministic.
 
 ---
 
@@ -294,6 +294,7 @@ Every error response, on every endpoint, uses one shape. No endpoint returns a b
 
 | Situation | Status | `code` |
 |---|---|---|
+| Missing/invalid `X-Tenant-ID` header | `400` | `missing_tenant_id` |
 | Missing/invalid `Idempotency-Key` header | `400` | `missing_idempotency_key` |
 | Same key, different payload | `400` | `idempotency_key_reuse` |
 | Request body fails schema validation | `422` | `validation_error` |
@@ -314,9 +315,10 @@ The global exception handlers in `src/api/error_handlers.py` guarantee this shap
 
 | Tenant ID | Plan | Subscription status | Seeded usage | Purpose |
 |---|---|---|---|---|
-| `tenant_free_fresh` | free | active | 0 API calls, 0 tokens | Clean baseline; PROBE 1 (idempotency) |
+| `tenant_clean` | free | active | 0 API calls, 0 tokens | Clean baseline; PROBE 1 (exactly-once metering) |
 | `tenant_free_boundary` | free | active | 999 API calls | PROBE 2 (boundary: next call → 200, then 429) |
-| `tenant_pro_active` | pro | active | 150 API calls; 125k tokens (50k input, 25k cached, 40k output, 10k reasoning) | PROBE 5 (pricing rollup), PROBE 3 target |
+| `tenant_checkout_demo` | free | active | 0 API calls, 0 tokens | PROBE 3 (Checkout upgrade Free to Pro) |
+| `tenant_pricing_demo` | pro | active | 50k input, 25k cached, 40k output, 10k reasoning tokens | PROBE 5 (pricing rollup matches $29.51) |
 | `tenant_pro_past_due` | pro | past_due | 0 | 402 path (account health before quota) |
 
 The seeder also upserts the two `plans` rows (`free`, `pro`) with their pinned limits and prices. Re-running the seeder resets these tenants to their documented baseline state (delete-then-insert for their usage events) so probes are reproducible.
@@ -339,7 +341,7 @@ The resulting `price_...` ID is pasted into `.env` as `STRIPE_PRO_PRICE_ID`.
 Tests never touch the development or evaluator database, and never start the scheduler:
 
 - **Isolated database**: the test suite sets `DATABASE_URL` to a dedicated SQLite file (or a per-run temp file) created fresh at session start and torn down at the end. Each test runs inside a transaction that is rolled back, so tests are order-independent and deterministic.
-- **Direct worker invocation**: worker tests call `run_once()` directly. The APScheduler job is never started under test (`WORKER_ENABLED=false` in the test environment), so there is no background timer racing the assertions.
+- **Direct worker invocation**: worker tests call `run_once()` directly. The embedded asyncio worker loop is never started under test (`WORKER_ENABLED=false` in the test environment), so there is no background timer racing the assertions.
 - **No live Stripe calls in unit tests**: webhook tests construct signed payloads locally with the test `whsec_` secret and post them to the endpoint; they do not call the Stripe API. Only the optional end-to-end Checkout walkthrough (documented in README, not part of `test:`) touches Stripe's servers.
 
 ---
