@@ -13,28 +13,38 @@ This capstone builds a backend service addressing all three: idempotent usage me
 ## 2. Explicit Non-Goals
 - No real payments or live Stripe mode (strictly Stripe Test Mode with test cards).
 - No external paid LLM calls (token counts metered via simulation payloads).
-- No floating-point math for money (strict integer micro-cents: 1 USD = 100,000,000 micro-cents; `ROUND_HALF_UP_AT_INVOICE`).
-- No complex proration or overage invoicing in core (focused on clean hard quotas & Free/Pro tiers; $0 marginal cost for API calls).
+- No floating-point math for money (strict integer micro-cents: 1 USD = 100,000,000 micro-cents).
+- No complex proration or overage invoicing in core (focused on clean hard quotas & Free/Pro tiers).
+- No per-call marginal pricing: flat-fee subscription; API calls are metered for quota only, at zero marginal cost.
+- No rounding of stored or intermediate values: exact micro-cents are summed, then rounded half-up once at the presentation boundary.
 
-## 3. Data Model & Concurrency
-- **Tenants**: Customer organizations (`id`, `name`, `email`, `created_at`).
+## 3. Data Model
+- **Tenants**: Multi-tenant customer organizations (`id`, `name`, `email`, `created_at`).
 - **Plans**: `free` (1k API calls/mo, 100k tokens/mo, $0) and `pro` (50k API calls/mo, 5M tokens/mo, $29/mo).
-- **Subscriptions**: Tenant subscription state (`tenant_id`, `plan_id`, `stripe_customer_id`, `stripe_subscription_id`, `status`, `current_period_start`, `current_period_end`, `stripe_last_event_created_at`).
-- **UsageEvents**: Individual metered billable events (`tenant_id`, `event_type="generation"`, `api_calls=1`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `cost_micro_cents`, `idempotency_key`, `timestamp`).
-- **IdempotencyKeys**: `UNIQUE(tenant_id, idempotency_key)` with `request_path`, `request_hash`, `response_status_code`, and `response_body` snapshot.
+- **Subscriptions**: Tenant subscription state (`tenant_id`, `plan_id`, `stripe_customer_id`, `stripe_subscription_id`, `status`).
+- **UsageEvents**: Individual metered billable events (`tenant_id`, `event_type`, `quantity`, `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`, `cost_micro_cents`, `idempotency_key`, `timestamp`).
+- **IdempotencyKeys**: `(tenant_id, idempotency_key)` unique records with `request_hash`, `response_status_code`, and `response_body` snapshot.
 - **WebhookEvents**: Deduplication table tracking processed `stripe_event_id`.
-- **Concurrency Serialization**: Atomic row-level lock (`SELECT ... FOR UPDATE` on tenant in Postgres / `BEGIN IMMEDIATE` in SQLite) guarantees zero-overshoot quota boundaries under concurrent requests.
 
-## 4. API Surface & Error Envelope
+## 4. API Surface
 - `POST /api/v1/generate`: Dummy billable endpoint requiring `X-Tenant-ID` and `Idempotency-Key`.
 - `GET /api/v1/tenants/{tenant_id}/usage`: Rollup endpoint calculating monthly usage, limit percentage, and exact token costs.
 - `POST /api/v1/billing/checkout`: Initiates Stripe test mode subscription checkout session.
 - `POST /api/v1/billing/webhooks/stripe`: Receives signed Stripe webhooks (`checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`), verifies signatures, deduplicates replays, and syncs plans.
 - `GET /health`: Healthcheck endpoint for container orchestration.
-- **Standardized Error Envelope**: All errors across all endpoints return `{"error": {"code": "...", "message": "...", "details": {...}}}`.
 
 ## 5. Layer Sketch
 1. **HTTP Layer** (`src/api/`): FastAPI routes, dependency injection, boundary validation, and global error handlers (clean 4xx JSON, no 500 leaks).
-2. **Core Domain** (`src/core/`): Idempotency deduplication, quota boundary checks (429 vs 402 precedence), token pricing calculator, and Stripe service.
+2. **Core Domain** (`src/core/`): Idempotency deduplication, quota boundary checks (429 vs 402), token pricing calculator, and Stripe service.
 3. **Persistence Layer** (`src/db/`): SQLAlchemy 2.0 Async models, repositories, and PostgreSQL / SQLite auto-fallback.
 4. **Worker Layer** (`src/workers/`): Background reconciliation of Stripe subscription state and quota alert evaluator with exponential retries.
+
+## 6. Key Design Decisions
+- **Status codes**: account health is checked before quota. Broken subscription state (`past_due`/`canceled`/`unpaid`) → `402`; healthy account over quota → `429` (including Free tenants at quota, with an upgrade hint in the body).
+- **Concurrency**: quota check + event insert run in one transaction that takes `SELECT ... FOR UPDATE` on the tenant row, so concurrent requests cannot both pass the boundary.
+- **Idempotency scope**: keys are globally unique per tenant across all endpoints (`UNIQUE (tenant_id, idempotency_key)`).
+- **Event granularity**: one `/generate` call = one usage event carrying both the API-call count and the token breakdown.
+- **Billing windows**: Free tenants roll up on the UTC calendar month; Pro tenants roll up on the Stripe billing period.
+- **Webhooks**: upsert semantics (order-independent), signature-verified, deduplicated by `stripe_event_id`.
+- **Errors**: one envelope everywhere — `{"error": {"code", "message", "details"}}`.
+- **Worker**: hybrid — runnable standalone (`python -m src.workers.reconciliation`) and optionally self-scheduling via APScheduler in the FastAPI lifespan.

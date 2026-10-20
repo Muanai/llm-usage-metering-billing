@@ -1,122 +1,178 @@
-# Evidence Document: Usage Metering & Billing Engine
+# EVIDENCE.md
 
-This document provides machine-verifiable and reproducible proof for every requirement checkbox from Section 6 and each of the 5 acceptance probes of the FlyRank Backend Track Capstone Brief.
+Proof for every requirement in the capstone brief (Section 6) and every acceptance probe (Section 12).
+Each section below has a **Claim**, a **How to reproduce** command, and a **Proof** block to paste real output into.
 
----
-
-## 1. Metering & Idempotency (PROBE 1)
-
-> **Requirement**: A billable action creates exactly one usage event, even under retries — deduplicated by idempotency key. Double-counting cannot happen.
-
-### Automated Test Proof
-<!-- Paste `pytest tests/test_idempotency.py -v` transcript here -->
-```text
-[Pending Implementation Execution]
-```
-
-### Transcript / Curl Proof (Same Request Sent Twice)
-<!-- Paste curl transcript showing 1st request (200 OK) and 2nd retried request (200 OK identical cached body, 0 extra usage rows created) -->
-```bash
-# Request 1:
-# curl -i -X POST http://localhost:8000/api/v1/generate ...
-
-# Request 2 (Duplicate Idempotency-Key):
-# curl -i -X POST http://localhost:8000/api/v1/generate ...
-
-# DB Count Check:
-# SELECT count(*) FROM usage_events WHERE idempotency_key = '...';
-# Expected: 1
-```
+> Rule: a claim without pasted evidence scores as not done. Fill each `Proof` block with a real terminal transcript, test output, or log line — not a description of one.
 
 ---
 
-## 2. Quotas & Boundary Honesty (PROBE 2)
+## Requirements (Section 6)
 
-> **Requirement**: Usage is checked against the tenant's plan; requests over the limit are rejected. Responses carry 429 / 402 with clear explanation.
+### R1 — Metering: exactly one usage event per billable action, even under retries
 
-### Boundary Test: Call 999 -> 1,000 (Allowed) -> 1,001 (Blocked 429)
-<!-- Paste test/curl output showing boundary transition -->
-```text
-[Pending Implementation Execution]
-```
+- **Claim:** The same request with the same `Idempotency-Key` creates exactly one usage event; the second response mirrors the first.
+- **Reproduce:**
+  ```bash
+  curl -s -X POST http://localhost:8000/api/v1/generate \
+    -H "X-Tenant-ID: tenant_free_fresh" \
+    -H "Idempotency-Key: demo-key-1" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"gemini-1.5-pro","prompt":"hi","simulated_tokens":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_tokens":0}}'
+  # run the exact same command a second time
+  ```
+- **Proof:**
+  ```
+  <paste both responses here; note identical `id` and that usage count stays at 1>
+  ```
 
-### Inactive / Unpaid Subscription Test (402 Payment Required)
-<!-- Paste curl output for past_due tenant receiving 402 -->
-```text
-[Pending Implementation Execution]
-```
+### R2 — Quotas: usage checked against plan; over-limit rejected with correct status + message
+
+- **Claim:** At 999/1000 the next call is admitted (200); at 1000/1000 the next call is rejected with `429` and a clear message. A `past_due` subscription is rejected with `402`.
+- **Reproduce:**
+  ```bash
+  # boundary tenant is seeded at 999 API calls
+  curl -i -X POST http://localhost:8000/api/v1/generate -H "X-Tenant-ID: tenant_free_boundary" -H "Idempotency-Key: b1" -d '{...}'   # expect 200
+  curl -i -X POST http://localhost:8000/api/v1/generate -H "X-Tenant-ID: tenant_free_boundary" -H "Idempotency-Key: b2" -d '{...}'   # expect 429
+  curl -i -X POST http://localhost:8000/api/v1/generate -H "X-Tenant-ID: tenant_pro_past_due" -H "Idempotency-Key: p1" -d '{...}'    # expect 402
+  ```
+- **Proof:**
+  ```
+  <paste the three status lines + JSON bodies>
+  ```
+
+### R3 — Cost calculation: monthly rollup + correct AI token pricing
+
+- **Claim:** Monthly usage rolls up into a cost figure; cached input is discounted, reasoning tokens are billed as output; totals match the pinned constants exactly.
+- **Reproduce:**
+  ```bash
+  curl -s http://localhost:8000/api/v1/tenants/tenant_pro_active/usage
+  ```
+- **Proof:**
+  ```
+  <paste the rollup JSON; show micro_cents matches the hand-computed value from config/pricing.json>
+  ```
+
+### R4 — Stripe integration: checkout works end-to-end in test mode
+
+- **Claim:** A test-mode Checkout session is created; completing it flips the tenant Free → Pro via webhook; `GET /usage` shows the new limits.
+- **Reproduce:**
+  ```bash
+  curl -s -X POST http://localhost:8000/api/v1/billing/checkout \
+    -H "Content-Type: application/json" \
+    -d '{"tenant_id":"tenant_free_fresh","plan_id":"pro"}'
+  # open checkout_url, pay with 4242 4242 4242 4242
+  # then:
+  curl -s http://localhost:8000/api/v1/tenants/tenant_free_fresh/usage
+  ```
+- **Proof:**
+  ```
+  <paste checkout response, the webhook log line, and the post-upgrade /usage showing plan=pro>
+  ```
+
+### R5 — Webhooks: verify signatures, ignore duplicates, update plan/status
+
+- **Claim:** A forged signature returns `400` and changes nothing; a replayed real event is processed once.
+- **Reproduce:**
+  ```bash
+  # forged
+  curl -i -X POST http://localhost:8000/api/v1/billing/webhooks/stripe \
+    -H "Stripe-Signature: t=1,v1=deadbeef" -d '{"id":"evt_fake"}'
+  # replay a real event twice via Stripe CLI
+  stripe trigger checkout.session.completed
+  stripe trigger checkout.session.completed   # same event id
+  ```
+- **Proof:**
+  ```
+  <paste the 400 response, then two webhook log lines showing processed once + ignored duplicate>
+  ```
+
+### R6 — Data model, tests & documentation
+
+- **Claim:** DB includes tenants, plans, subscriptions, usage events; data isolated per tenant; README + diagram + setup present; required files present.
+- **Reproduce:**
+  ```bash
+  ls README.md capstone.yaml EVIDENCE.md BUILDLOG.md .env.example
+  python -m pytest -q
+  ```
+- **Proof:**
+  ```
+  <paste file listing + test summary>
+  ```
 
 ---
 
-## 3. Cost Calculation & Token Pricing Rules (PROBE 5)
+## Acceptance Probes (Section 12)
 
-> **Requirement**: Monthly usage rolls up into a cost figure per tenant. AI token pricing handles cached input tokens (discounted), reasoning tokens (billed as output), and individual category multipliers. Pricing constants pinned in config.
+### PROBE 1 — Idempotency: same request twice → one event, mirrored response
 
-### Pinned Rates Configuration (`config/pricing.json`)
-<!-- Verify pinned pricing rates -->
-```json
-{
-  "rates_per_million_tokens_cents": {
-    "standard_input": 200,
-    "cached_input": 50,
-    "standard_output": 800,
-    "reasoning_output": 800
-  }
-}
-```
+- **Test:** `tests/test_idempotency.py`
+- **Proof:**
+  ```
+  <paste pytest output for this file>
+  ```
 
-### Verification Calculation Proof (`GET /api/v1/tenants/tenant_pricing_demo/usage`)
-<!-- Paste curl transcript showing exact breakdown matching $29.51 -->
-```text
-[Pending Implementation Execution]
-```
+### PROBE 2 — Quota boundary: exact boundary behavior + 429/402
 
----
+- **Test:** `tests/test_quotas.py`
+- **Proof:**
+  ```
+  <paste pytest output for this file>
+  ```
 
-## 4. Stripe Integration & Webhooks (PROBE 3 & PROBE 4)
+### PROBE 3 — Checkout flips Free → Pro; /usage reflects new limits
 
-> **Requirement**: Subscription checkout in test mode; signature-verified webhooks; replay deduplication; Free -> Pro plan synchronization.
+- **Test:** `tests/test_stripe_webhooks.py`
+- **Proof:**
+  ```
+  <paste pytest output for this file>
+  ```
 
-### PROBE 3: Checkout Completion Flips Free -> Pro
-<!-- Paste Stripe CLI webhook forward and tenant plan update transcript -->
-```text
-[Pending Implementation Execution]
-```
+### PROBE 4 — Forged webhook → 400; replay → processed once
 
-### PROBE 4: Forged Webhook Signature Rejected (400 Bad Request)
-<!-- Paste curl sending invalid signature yielding 400 Bad Request -->
-```text
-[Pending Implementation Execution]
-```
+- **Test:** `tests/test_stripe_webhooks.py`
+- **Proof:**
+  ```
+  <paste pytest output for this file>
+  ```
 
-### PROBE 4: Replay Webhook Event Processed Once (Duplicate Ignored)
-<!-- Paste curl/Stripe CLI sending same event twice yielding status: ignored on second call -->
-```text
-[Pending Implementation Execution]
-```
+### PROBE 5 — Pinned pricing rules produce exact expected totals
+
+- **Test:** `tests/test_pricing.py`
+- **Proof:**
+  ```
+  <paste pytest output for this file>
+  ```
 
 ---
 
-## 5. Background Job: Stripe Reconciliation & Quota Alerts (Requirement #3)
+## Shared Requirements (Section 12)
 
-> **Requirement**: ≥1 background job off the request path, with retries and failure alert logging.
+### REQ #1 — Layered architecture (data / logic / HTTP separated)
 
-### Background Worker Execution Proof
-<!-- Paste worker logs showing periodic cycle, Stripe sync, and >=80% / 100% quota alert triggers -->
-```text
-[Pending Implementation Execution]
-```
+- **Proof:** `<point to src/api, src/core, src/db; paste the tree>`
 
----
+### REQ #2 — Validation at the boundary (bad input → clean 4xx, never 500)
 
-## 6. Shared Requirements Verification Summary
+- **Proof:** `<paste a curl with a malformed body returning 422 in the standard envelope>`
 
-| # | Requirement | Implementation Evidence |
-|---|---|---|
-| 1 | **Layered architecture** | `src/api` (HTTP), `src/core` (logic), `src/db` (data), `src/workers` (jobs) |
-| 2 | **Validation at boundary** | Pydantic v2 schemas; bad input $\rightarrow$ clean 4xx envelope, never 500 |
-| 3 | **≥1 background job** | `src/workers/reconciliation.py` (Stripe sync + quota alerts + retries) |
-| 4 | **Real persistence** | PostgreSQL + SQLite fallback, Alembic migrations, tenant isolation indexes |
-| 5 | **Idempotency** | Atomic `UNIQUE(tenant_id, idempotency_key)` + row lock, zero duplicate events |
-| 6 | **Secrets clean** | Environment variables via `.env`, template in `.env.example`, no hardcoded keys |
-| 7 | **Cost tracked** | Integer micro-cents arithmetic, pinned token pricing rules, `ROUND_HALF_UP` |
+### REQ #3 — ≥1 background job (off request path, retries + failure alert)
+
+- **Test:** `tests/test_worker.py`
+- **Proof:** `<paste pytest output + a log line showing a retry and a failure alert>`
+
+### REQ #4 — Real persistence (migrations, indexes, isolated tenants)
+
+- **Proof:** `<paste alembic history + the index definitions>`
+
+### REQ #5 — Idempotency where it matters
+
+- **Proof:** `<cross-reference PROBE 1>`
+
+### REQ #6 — Secrets clean (env only, never logged)
+
+- **Proof:** `<paste .gitignore showing .env, and grep proving no key appears in logs>`
+
+### REQ #7 — Cost tracked, if AI is used (per call, attributed, budget guard)
+
+- **Proof:** `<paste per-event cost_micro_cents + the quota guard behavior>`
