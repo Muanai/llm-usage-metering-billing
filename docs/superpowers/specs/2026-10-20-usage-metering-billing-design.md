@@ -33,10 +33,10 @@ To ensure zero-risk correctness and respect capstone constraints:
 - **Language & Runtime**: Python 3.11+
 - **Web Framework**: FastAPI (asynchronous, auto-generating OpenAPI/Swagger UI at `/docs`)
 - **Data Validation & Settings**: Pydantic v2 + Pydantic-Settings
-- **ORM & Database Driver**: SQLAlchemy 2.0 (asyncio) + AsyncPG (PostgreSQL) / aiosqlite (SQLite fallback)
+- **ORM & Database Driver**: SQLAlchemy 2.0 (asyncio) + AsyncPG (PostgreSQL) / aiosqlite (SQLite auto-fallback)
 - **Migrations**: Alembic
 - **Test Suite**: Pytest + pytest-asyncio + HTTPX
-- **Database**: PostgreSQL (via Docker Compose) with automatic zero-configuration SQLite fallback for seamless single-command testing.
+- **Database**: PostgreSQL (via Docker Compose) with automatic zero-configuration SQLite fallback (`sqlite+aiosqlite:///./data/app.db`) for seamless single-command testing on any clean machine.
 - **Stripe Tooling**: Stripe Python SDK (`stripe`) + Stripe CLI (`stripe listen`, `stripe trigger`)
 
 ### Layered Architecture Structure
@@ -69,8 +69,8 @@ llm-usage-metering-billing/
 │   └── main.py                   # FastAPI application factory, lifespan, & middleware
 ├── migrations/                   # Alembic schema migrations
 ├── scripts/
-│   └── seed.py                   # Demo data seeder (plans, tenants, baseline usage)
-├── tests/                        # Acceptance probe test suite
+│   └── seed.py                   # Demo data seeder with documented fixtures contract
+├── tests/                        # Acceptance probe test suite (isolated test DB)
 ├── docker-compose.yml            # PostgreSQL container definition
 ├── capstone.yaml                 # Evaluator manifest: run, seed, test, base_url
 ├── EVIDENCE.md                   # Pasted proof per acceptance requirement
@@ -91,7 +91,7 @@ erDiagram
     PLANS ||--o{ SUBSCRIPTIONS : "assigned"
 
     TENANTS {
-        string id PK "e.g., 'tenant_a'"
+        string id PK "e.g., 'tenant_free_boundary'"
         string name "Organization name"
         string email "Contact email"
         datetime created_at
@@ -114,16 +114,17 @@ erDiagram
         string stripe_customer_id "cus_test_..."
         string stripe_subscription_id "sub_test_..."
         string status "'active', 'past_due', 'canceled', 'incomplete'"
-        datetime current_period_start
-        datetime current_period_end
+        datetime current_period_start "Cycle start"
+        datetime current_period_end "Cycle end"
+        bigint stripe_last_event_created_at "Unix timestamp to prevent out-of-order stale updates"
         datetime updated_at
     }
 
     USAGE_EVENTS {
         string id PK "UUID"
         string tenant_id FK "Index (tenant_id, created_at)"
-        string event_type "'api_call' or 'ai_tokens'"
-        int quantity "Total count"
+        string event_type "'generation' (exactly one row per billable call)"
+        int api_calls "1"
         int input_tokens "Standard input tokens"
         int cached_input_tokens "Cached input tokens"
         int output_tokens "Standard output tokens"
@@ -136,7 +137,7 @@ erDiagram
     IDEMPOTENCY_KEYS {
         string id PK "UUID"
         string tenant_id FK
-        string idempotency_key "Unique constraint: (tenant_id, idempotency_key)"
+        string idempotency_key "Unique constraint: UNIQUE(tenant_id, idempotency_key)"
         string request_path "API route path"
         string request_hash "SHA-256 of normalized request body"
         int response_status_code "Cached HTTP status (e.g. 200, 429)"
@@ -155,205 +156,106 @@ erDiagram
 
 ---
 
-## 5. Core Engine Specifications
+## 5. Core Engine Specifications & Edge Case Solutions
 
-### 5.1 Exactly-Once Metering & Idempotency Engine
-- **Headers Required**: `X-Tenant-ID: <string>` and `Idempotency-Key: <string>`.
-- **Deduplication Logic**:
-  1. Inspect `IDEMPOTENCY_KEYS` table for `(tenant_id, idempotency_key)`.
-  2. If found:
-     - Verify SHA-256 hash of request payload against stored `request_hash`.
-     - If hash differs: return `400 Bad Request` with message `"Idempotency-Key reused with different request payload"`.
-     - If hash matches: return the previously stored status code, headers, and response body immediately. No usage event is created.
-  3. If not found:
-     - Run quota checks and billable action within a single database transaction.
-     - Save response snapshot and status into `IDEMPOTENCY_KEYS`.
-     - Return the freshly generated response.
-- **Concurrency Safety**: Enforced via DB unique constraint `UNIQUE (tenant_id, idempotency_key)` and row-level locking to prevent race conditions during simultaneous identical requests.
+### 5.1 Exactly-Once Metering & Idempotency Engine (Q6 & Q8)
+- **One Event per Billable Call (Q6)**: Each `POST /api/v1/generate` request creates **exactly one** record in `USAGE_EVENTS` with `event_type: "generation"`, `api_calls: 1`, token breakdowns, and total `cost_micro_cents`. This directly satisfies PROBE 1 (`SELECT count(*) FROM usage_events WHERE idempotency_key = :key == 1`).
+- **Global Key Scope (Q8)**: Constraint is `UNIQUE (tenant_id, idempotency_key)`.
+  - If a key exists and both `request_path` and `request_hash` match $\rightarrow$ replay cached response and status code.
+  - If a key exists but `request_path` or `request_hash` differs $\rightarrow$ return `400 Bad Request` with `{"error": {"code": "idempotency_conflict", "message": "Idempotency key was already used for a different request path or payload."}}`.
+- **Missing Header (Q9)**: Missing `Idempotency-Key` or `X-Tenant-ID` returns `400 Bad Request` with structured error envelope.
 
-### 5.2 Quota Enforcement & Boundary Honesty
-- **Rule**: Check is evaluated *before* the billable action executes:
-  $$\text{current\_monthly\_usage} + \text{requested\_quantity} \le \text{plan\_limit}$$
-- **Boundary Behavior**:
-  - Boundary: Free Plan limit = 1,000 API calls.
-  - At 999 used: request requesting 1 call $\rightarrow$ **Allowed (200 OK)**. Usage becomes 1,000.
-  - At 1,000 used: request requesting 1 call $\rightarrow$ **Blocked (429 Too Many Requests)**.
-- **Status Code Demarcation**:
-  - **`429 Too Many Requests`**: Used when the tenant has an active plan but has exceeded their allotted monthly usage quota. Returns `Retry-After: <seconds>` header and descriptive JSON error.
-  - **`402 Payment Required`**: Used when the tenant's subscription status is not active (e.g. `past_due`, `canceled`, `unpaid`), informing the client that payment or card update is required before proceeding.
+### 5.2 Quota Enforcement, Concurrency & Boundary Precedence (Q3 & Q4)
+- **Serialized Concurrency via Row Locking (Q3)**:
+  To eliminate race conditions when two concurrent requests arrive at 999/1000 calls:
+  `await db.execute(select(Tenant).where(Tenant.id == tenant_id).with_for_update())`
+  In PostgreSQL, this locks the tenant record for the duration of the transaction. In SQLite, `BEGIN IMMEDIATE` provides equivalent serial execution. Concurrent requests queue cleanly, observe the updated usage sum, and the 1,001st request is rejected with `429 Too Many Requests`.
+- **Precedence Decision Matrix (Q4)**:
 
-### 5.3 Cost Calculation & Token Pricing Rules
-- **Rule 1**: Cached input tokens are priced at a discount compared to fresh input tokens.
-- **Rule 2**: Reasoning tokens count and are priced as output tokens.
-- **Rule 3**: Token categories are never summed indiscriminately; each is computed with its specific rate.
-- **Formula**:
-  $$\text{Cost} = (\text{fresh\_input} \times R_{\text{input}}) + (\text{cached\_input} \times R_{\text{cached}}) + ((\text{output} + \text{reasoning}) \times R_{\text{output}})$$
-- **Precision**: Computed in integer **micro-cents** ($1\text{ USD} = 100\text{ cents} = 100,000,000\text{ micro-cents}$).
+| Subscription Status | Current Usage vs Quota | HTTP Status | Action / Explanation |
+|---|---|---|---|
+| `past_due`, `unpaid`, `canceled` | Any ($\le$ or $>$) | **`402 Payment Required`** | **Priority 1**: Financial entitlement failure. Account suspended before evaluating quota volume. |
+| `active` (Free or Pro) | Usage + Requested $>$ Limit | **`429 Too Many Requests`** | **Priority 2**: Volume quota exceeded. Returns `Retry-After: <seconds>` header. |
+| `active` (Free or Pro) | Usage + Requested $\le$ Limit | **`200 OK`** | Operation permitted. |
+
+### 5.3 Money Math, API Call Pricing & Rounding Rules (Q1 & Q2)
+- **Fractional Cents & Rounding Rule (Q1)**:
+  - All database fields and internal aggregations strictly use integer **micro-cents** ($1\text{ USD} = 100\text{ cents} = 100,000,000\text{ micro-cents}$).
+  - No intermediate rounding is ever performed.
+  - At the invoice/summary boundary, convert to `cents` using standard **`ROUND_HALF_UP`**:
+    $$\text{billed\_cents} = \left\lfloor \frac{\text{total\_micro\_cents} + 500,000}{1,000,000} \right\rfloor$$
+  - The API response provides `micro_cents`, `exact_dollars` string, and rounded integer `cents` for 100% deterministic validation in PROBE 5.
+- **API Call Pricing (Q2)**:
+  - Within core scope, API calls have **$0.00 marginal cost**; they are included in the base subscription fee ($0 Free, $29 Pro) and metered strictly for hard quota enforcement.
 - **Pinned Rates (`config/pricing.json`)**:
-  - Standard Input: $2.00 / 1M tokens ($200\text{ cents} / 1\text{M} = 200\text{ micro-cents/token}$)
-  - Cached Input: $0.50 / 1M tokens ($50\text{ cents} / 1\text{M} = 50\text{ micro-cents/token}$, 75% discount)
-  - Output Tokens: $8.00 / 1M tokens ($800\text{ cents} / 1\text{M} = 800\text{ micro-cents/token}$)
-  - Reasoning Tokens: $8.00 / 1M tokens ($800\text{ cents} / 1\text{M} = 800\text{ micro-cents/token}$)
+  - `standard_input`: $2.00 / 1M ($200\text{ cents} / 1\text{M} = 200\text{ micro-cents/token}$)
+  - `cached_input`: $0.50 / 1M ($50\text{ cents} / 1\text{M} = 50\text{ micro-cents/token}$, 75% discount)
+  - `standard_output`: $8.00 / 1M ($800\text{ cents} / 1\text{M} = 800\text{ micro-cents/token}$)
+  - `reasoning_output`: $8.00 / 1M (reasoning tokens count and are billed as output tokens)
 
-### 5.4 Stripe Test Mode Integration & Webhooks
-- **Checkout (`POST /api/v1/billing/checkout`)**:
-  - Creates a Stripe Checkout Session in subscription mode with `client_reference_id = tenant_id`.
-  - Returns `checkout_url` and `session_id`.
-- **Webhook Endpoint (`POST /api/v1/billing/webhooks/stripe`)**:
-  - Uses raw request byte payload and `Stripe-Signature` header with `stripe.Webhook.construct_event`.
-  - Forged signatures or missing headers $\rightarrow$ immediate `400 Bad Request` with no state modification.
-  - Replay deduplication: Checks `WEBHOOK_EVENTS` for `stripe_event_id`. If already present $\rightarrow$ returns `200 OK` with `{"status": "ignored", "reason": "duplicate_event"}`.
-  - Event Handlers:
-    - `checkout.session.completed`: Sets tenant's plan to `pro`, status to `active`, records Stripe customer & subscription IDs.
-    - `customer.subscription.updated`: Updates subscription status (`active`, `past_due`, etc.).
-    - `customer.subscription.deleted`: Reverts tenant to `free` plan.
+### 5.4 Monthly Reset Basis (Q5)
+- **Free Tier**: Usage window defaults to the UTC calendar month (`YYYY-MM-01 00:00:00` to `YYYY-MM-01 00:00:00` next month).
+- **Pro Tier**: Usage window is anchored by Stripe subscription period: `[subscription.current_period_start, subscription.current_period_end)`.
+- **Query Aggregation**: Uniformly aggregates usage between `current_period_start` and `current_period_end`.
 
-### 5.5 Background Job: Stripe Reconciliation & Quota Alerts
-- **Worker Script / Background Task**: `src/workers/reconciliation.py`.
-- **Responsibilities**:
-  1. **Reconciliation**: Periodically queries tenants with active Stripe subscriptions, calls Stripe API to cross-verify subscription state, and reconciles any discrepancies caused by missed webhooks.
-  2. **Quota Alerting**: Checks current cycle usage against plan limits. Emits structured log alerts at $\ge 80\%$ and $\ge 100\%$ thresholds.
-  3. **Resilience**: Implements exponential backoff retries on network failures and logs failure alerts if retries are exhausted.
+### 5.5 Stripe Webhooks & Out-of-Order Handling (Q7)
+- **Upsert Pattern**: Handlers for `checkout.session.completed` and `customer.subscription.updated` perform upsert operations using `tenant_id` and `stripe_subscription_id`.
+- **Timestamp Ordering Guard**: Compares incoming `event.created` against stored `stripe_last_event_created_at` to discard stale out-of-order events.
+- **Signature Verification**: Verified against raw request body using Stripe CLI secret `whsec_...`. Forged signatures return `400 Bad Request`.
+- **Replay Deduplication**: Event IDs stored in `WEBHOOK_EVENTS`. Replays return `200 OK` with `{"status": "ignored", "reason": "duplicate_event"}`.
+
+### 5.6 Background Worker Execution & Test Isolation (Q10 & Q14)
+- **FastAPI Lifespan Scheduler (Q10)**: An `asyncio.create_task` runs `run_reconciliation_loop()` at an interval during server run time (`uvicorn src.main:app`), ensuring the worker is always active under the single `run:` command without external supervisors.
+- **Direct CLI Runner**: Also callable via `python -m src.workers.reconciliation` or `await run_reconciliation_once()` in tests.
+- **Test Database Isolation (Q14)**: Pytest uses a dedicated isolated database (`sqlite+aiosqlite:///./data/test.db`), running clean transactions and never colliding with the live application DB.
 
 ---
 
-## 6. API Interface Contracts
+## 6. Seed Data & Bootstrap Contracts (Q12 & Q13)
 
-### 1. `POST /api/v1/generate` (Billable Endpoint)
-- **Headers**:
-  - `X-Tenant-ID: tenant_a` (Required)
-  - `Idempotency-Key: req_abc123` (Required)
-- **Request Body**:
-  ```json
-  {
-    "model": "gemini-1.5-pro",
-    "prompt": "Summarize this quarterly report",
-    "simulated_tokens": {
-      "input_tokens": 1000,
-      "cached_input_tokens": 500,
-      "output_tokens": 400,
-      "reasoning_tokens": 100
-    }
-  }
-  ```
-- **Success Response (200 OK)**:
-  ```json
-  {
-    "id": "evt_019283aa-8812-70b1-bce2-6412e8b091f0",
-    "tenant_id": "tenant_a",
-    "status": "success",
-    "result": "Simulated AI generation output text.",
-    "usage": {
-      "api_calls": 1,
-      "input_tokens": 1000,
-      "cached_input_tokens": 500,
-      "output_tokens": 400,
-      "reasoning_tokens": 100,
-      "total_tokens": 2000
-    },
-    "cost": {
-      "micro_cents": 625000,
-      "cents": 0.625,
-      "formatted": "$0.00625"
-    }
-  }
-  ```
-- **Error Response (429 Too Many Requests)**:
-  ```json
-  {
-    "error": {
-      "code": "quota_exceeded",
-      "message": "Monthly API call limit reached for Free plan (1000/1000). Upgrade to Pro to continue.",
+### 6.1 Deterministic Fixtures (`scripts/seed.py`)
+| Tenant ID | Plan | Initial State | Evaluation Target |
+|---|---|---|---|
+| `tenant_free_boundary` | Free | Exactly 999 API calls seeded in current month | **PROBE 2**: 1st call succeeds (1000/1000, 200 OK); 2nd call rejected (429 Too Many Requests). |
+| `tenant_pro_past_due` | Pro | Subscription status: `past_due` | **PROBE 2**: Any billable request rejected with `402 Payment Required`. |
+| `tenant_checkout_demo` | Free | 0 usage, clean status | **PROBE 3**: Ready for Stripe Checkout upgrade test. |
+| `tenant_pricing_demo` | Pro | 50k input, 25k cached, 40k output, 10k reasoning tokens | **PROBE 5**: Immediate match for `$29.51` ($0.5125 token cost + $29 Pro base fee). |
+| `tenant_clean` | Free | 0 usage | **PROBE 1**: Clean slate for idempotency verification. |
+
+### 6.2 Stripe Price Bootstrap (Q13)
+- `scripts/seed.py` checks if `STRIPE_PRO_PRICE_ID` is set or exists in Stripe test mode. If not, it automatically calls `stripe.Price.create()` to provision a Pro Plan price ($29.00/mo) and binds it to the local plans table.
+- Offline tests use mock fixtures requiring zero external network access.
+
+---
+
+## 7. Submission Artifacts & Verification Contracts (Q11 & Q15)
+
+### `capstone.yaml`
+```yaml
+run: uvicorn src.main:app --host 0.0.0.0 --port 8000
+seed: python scripts/seed.py
+test: pytest -v
+base_url: http://localhost:8000
+endpoints:
+  health: GET /health
+  generate: POST /api/v1/generate
+  usage: GET /api/v1/tenants/{tenant_id}/usage
+  checkout: POST /api/v1/billing/checkout
+  webhook: POST /api/v1/billing/webhooks/stripe
+```
+
+### Unified Error Envelope (Q9)
+```json
+{
+  "error": {
+    "code": "quota_exceeded",
+    "message": "Monthly API call limit reached for Free plan (1000/1000). Upgrade to Pro to continue.",
+    "details": {
       "metric": "api_calls",
       "current_usage": 1000,
       "limit": 1000,
       "plan": "free"
     }
   }
-  ```
-
-### 2. `GET /api/v1/tenants/{tenant_id}/usage` (Rollup Endpoint)
-- **Response (200 OK)**:
-  ```json
-  {
-    "tenant_id": "tenant_a",
-    "period": "2026-10",
-    "plan": {
-      "id": "pro",
-      "name": "Pro Plan",
-      "base_price_cents": 2900
-    },
-    "subscription_status": "active",
-    "usage": {
-      "api_calls": {
-        "used": 150,
-        "limit": 50000,
-        "percent_used": 0.3
-      },
-      "tokens": {
-        "total_used": 125000,
-        "limit": 5000000,
-        "percent_used": 2.5,
-        "breakdown": {
-          "standard_input": 50000,
-          "cached_input": 25000,
-          "standard_output": 40000,
-          "reasoning": 10000
-        }
-      }
-    },
-    "cost": {
-      "token_cost_micro_cents": 51250000,
-      "token_cost_cents": 51,
-      "base_subscription_cents": 2900,
-      "total_cents": 2951,
-      "formatted": "$29.51"
-    }
-  }
-  ```
-
-### 3. `POST /api/v1/billing/checkout`
-- **Request Body**:
-  ```json
-  {
-    "tenant_id": "tenant_a",
-    "plan_id": "pro"
-  }
-  ```
-- **Response (200 OK)**:
-  ```json
-  {
-    "checkout_url": "https://checkout.stripe.com/c/pay/cs_test_a1b2c3...",
-    "session_id": "cs_test_a1b2c3..."
-  }
-  ```
-
-### 4. `POST /api/v1/billing/webhooks/stripe`
-- **Headers**: `Stripe-Signature: t=...,v1=...`
-- **Body**: Raw binary Stripe event payload.
-- **Responses**:
-  - `200 OK`: `{"status": "success", "event_id": "evt_..."}` or `{"status": "ignored", "reason": "duplicate_event"}`
-  - `400 Bad Request`: `{"error": "Invalid signature"}` or `{"error": "Invalid payload"}`
-
----
-
-## 7. Acceptance Probes & Verification Matrix
-
-| Probe | Requirement Checked | Verification Test File |
-|---|---|---|
-| **PROBE 1** | Exactly-once metering via idempotency key (same key $\rightarrow$ 1 event, identical response) | `tests/test_idempotency.py` |
-| **PROBE 2** | Quota boundary honesty: at 1,000/1,000 $\rightarrow$ 200 OK, at 1,001 $\rightarrow$ 429 Too Many Requests; inactive plan $\rightarrow$ 402 Payment Required | `tests/test_quotas.py` |
-| **PROBE 3** | Stripe Checkout test completion $\rightarrow$ webhook flips tenant Free $\rightarrow$ Pro; `/usage` limits updated | `tests/test_stripe_webhooks.py` |
-| **PROBE 4** | Webhook forged signature $\rightarrow$ 400 Bad Request; Webhook replay twice $\rightarrow$ processed once | `tests/test_stripe_webhooks.py` |
-| **PROBE 5** | AI token pricing: cached-input 75% discount, reasoning tokens billed as output, rollup matches pinned constants | `tests/test_pricing.py` |
-| **REQ #3** | Background worker reconciliation & quota alert detection with retries | `tests/test_worker.py` |
-
----
-
-## 8. Submission Artifacts
-
-1. **`capstone.yaml`**: Standard manifest with `run:`, `seed:`, `test:`, and endpoints list.
-2. **`EVIDENCE.md`**: Direct terminal transcripts and test execution proofs for each probe and requirement.
-3. **`BUILDLOG.md`**: Transparent log of design choices, AI pairing iterations, and debugging steps.
-4. **`README.md`**: Architectural diagram, quickstart setup, Stripe CLI testing guide, and documented limitations.
-5. **`.env.example`**: Safe environment variable template.
+}
+```
