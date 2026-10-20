@@ -15,6 +15,8 @@ This capstone builds a backend service addressing all three: idempotent usage me
 - No external paid LLM calls (token counts metered via simulation payloads).
 - No floating-point math for money (strict integer micro-cents: 1 USD = 100,000,000 micro-cents).
 - No complex proration or overage invoicing in core (focused on clean hard quotas & Free/Pro tiers).
+- No per-call marginal pricing: flat-fee subscription; API calls are metered for quota only, at zero marginal cost.
+- No rounding of stored or intermediate values: exact micro-cents are summed, then rounded half-up once at the presentation boundary.
 
 ## 3. Data Model
 - **Tenants**: Multi-tenant customer organizations (`id`, `name`, `email`, `created_at`).
@@ -36,3 +38,13 @@ This capstone builds a backend service addressing all three: idempotent usage me
 2. **Core Domain** (`src/core/`): Idempotency deduplication, quota boundary checks (429 vs 402), token pricing calculator, and Stripe service.
 3. **Persistence Layer** (`src/db/`): SQLAlchemy 2.0 Async models, repositories, and PostgreSQL / SQLite auto-fallback.
 4. **Worker Layer** (`src/workers/`): Background reconciliation of Stripe subscription state and quota alert evaluator with exponential retries.
+
+## 6. Key Design Decisions
+- **Status codes**: account health is checked before quota. Broken subscription state (`past_due`/`canceled`/`unpaid`) → `402`; healthy account over quota → `429` (including Free tenants at quota, with an upgrade hint in the body).
+- **Concurrency**: quota check + event insert run in one transaction that takes `SELECT ... FOR UPDATE` on the tenant row, so concurrent requests cannot both pass the boundary.
+- **Idempotency scope**: keys are globally unique per tenant across all endpoints (`UNIQUE (tenant_id, idempotency_key)`).
+- **Event granularity**: one `/generate` call = one usage event carrying both the API-call count and the token breakdown.
+- **Billing windows**: Free tenants roll up on the UTC calendar month; Pro tenants roll up on the Stripe billing period.
+- **Webhooks**: upsert semantics (order-independent), signature-verified, deduplicated by `stripe_event_id`.
+- **Errors**: one envelope everywhere — `{"error": {"code", "message", "details"}}`.
+- **Worker**: hybrid — runnable standalone (`python -m src.workers.reconciliation`) and optionally self-scheduling via APScheduler in the FastAPI lifespan.

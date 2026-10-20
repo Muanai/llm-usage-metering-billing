@@ -25,6 +25,8 @@ To ensure zero-risk correctness and respect capstone constraints:
 - **No Live External AI API Calls**: Token counts are metered and simulated via payload metadata; no external LLM API key or paid credit is required.
 - **No Invoicing, Proration, or Overage Billing in Core**: Core focuses strictly on hard quotas and recurring plans (Free vs. Pro). Advanced invoicing and mid-cycle proration are deferred as optional post-core stretch goals.
 - **No Floating-Point Math for Currency**: Money amounts are strictly stored and computed as integer units (cents and micro-cents).
+- **No Per-Call Marginal Pricing**: This is a flat-fee subscription model. API calls are metered purely for quota enforcement and carry **zero marginal cost**; the only cost components are token usage and the plan's base subscription fee.
+- **No Rounding of Stored or Intermediate Values**: Exact integer micro-cents are persisted and summed; rounding (half-up) happens once, at the presentation boundary only.
 
 ---
 
@@ -170,6 +172,19 @@ erDiagram
      - Save response snapshot and status into `IDEMPOTENCY_KEYS`.
      - Return the freshly generated response.
 - **Concurrency Safety**: Enforced via DB unique constraint `UNIQUE (tenant_id, idempotency_key)` and row-level locking to prevent race conditions during simultaneous identical requests.
+- **Key Scope**: Idempotency keys are **globally unique per tenant across every endpoint**, not per route — one key = one execution from the client. The constraint is `UNIQUE (tenant_id, idempotency_key)`; `request_path` is stored for diagnostics only and is not part of the uniqueness key.
+
+### 5.1b Event Granularity (One Request = One Event)
+A single `POST /api/v1/generate` call produces **exactly one** `USAGE_EVENTS` row - never two. That row carries both dimensions of the request:
+
+- `event_type = "api_call"`, `quantity = 1` (drives the API-call quota counter), **and**
+- the four token fields populated (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens`) plus the computed `cost_micro_cents` (drive the token quota counter and cost rollup).
+
+Consequences:
+- The API-call rollup counts rows where `event_type = "api_call"` (equivalently, sums `quantity`).
+- The token rollup sums the token columns across those same rows; it does not require a separate `ai_tokens` event.
+- Idempotency replay returns the single stored response for the single stored event - there is no partial-event state to reconcile.
+- `event_type = "ai_tokens"` remains a valid enum value for a future token-only endpoint, but the core `/generate` flow does not emit it.
 
 ### 5.2 Quota Enforcement & Boundary Honesty
 - **Rule**: Check is evaluated *before* the billable action executes:
@@ -178,17 +193,29 @@ erDiagram
   - Boundary: Free Plan limit = 1,000 API calls.
   - At 999 used: request requesting 1 call $\rightarrow$ **Allowed (200 OK)**. Usage becomes 1,000.
   - At 1,000 used: request requesting 1 call $\rightarrow$ **Blocked (429 Too Many Requests)**.
-- **Status Code Demarcation**:
-  - **`429 Too Many Requests`**: Used when the tenant has an active plan but has exceeded their allotted monthly usage quota. Returns `Retry-After: <seconds>` header and descriptive JSON error.
-  - **`402 Payment Required`**: Used when the tenant's subscription status is not active (e.g. `past_due`, `canceled`, `unpaid`), informing the client that payment or card update is required before proceeding.
+- **Concurrency Safety**: Quota evaluation and event insertion happen inside one transaction that first takes a row lock on the tenant (`SELECT ... FROM tenants WHERE id = :tenant_id FOR UPDATE`). All billable requests for a tenant therefore serialize, so two concurrent requests can never both observe `999/1000` and both be admitted. The tradeoff — reduced per-tenant throughput — is accepted in exchange for provably exact boundaries.
+- **Status Code Demarcation**: Account health is evaluated **before** the numeric quota. A subscription that is not in good standing fails with `402` regardless of remaining quota; only a healthy account reaches the quota check and its `429`.
+
+  | Condition | Status | Meaning |
+  |---|---|---|
+  | Subscription status not in good standing (`past_due`, `canceled`, `unpaid`, `incomplete`) | `402 Payment Required` | Payment or card update required before any billable action |
+  | Account healthy, `current + requested > limit` | `429 Too Many Requests` | Monthly allowance exhausted; includes `Retry-After: <seconds>` |
+  | Account healthy, `current + requested <= limit` | `200 OK` | Action admitted and metered |
+
+- **Free Tenants at Quota**: A Free tenant with an active plan that exhausts its allowance receives **`429`**, never `402` — their plan is healthy, their allowance is not. The upgrade path is surfaced in the response body (`upgrade_required: true`, `upgrade_plan: "pro"`), not by overloading the status code.
 
 ### 5.3 Cost Calculation & Token Pricing Rules
+- **Pricing Model**: Flat-fee subscription. The billable cost of a request is token usage priced per category, plus the plan's base fee. API calls carry **zero marginal cost** and exist only to drive quota enforcement; they never appear as a line item in cost.
 - **Rule 1**: Cached input tokens are priced at a discount compared to fresh input tokens.
 - **Rule 2**: Reasoning tokens count and are priced as output tokens.
 - **Rule 3**: Token categories are never summed indiscriminately; each is computed with its specific rate.
 - **Formula**:
-  $$\text{Cost} = (\text{fresh\_input} \times R_{\text{input}}) + (\text{cached\_input} \times R_{\text{cached}}) + ((\text{output} + \text{reasoning}) \times R_{\text{output}})$$
-- **Precision**: Computed in integer **micro-cents** ($1\text{ USD} = 100\text{ cents} = 100,000,000\text{ micro-cents}$).
+  $$\text{Cost}_{\text{micro}} = (\text{fresh\_input} \times R_{\text{input}}) + (\text{cached\_input} \times R_{\text{cached}}) + ((\text{output} + \text{reasoning}) \times R_{\text{output}})$$
+- **Precision & Rounding**:
+  - Every per-event cost is stored as an exact integer **micro-cent** value ($1\text{ USD} = 100\text{ cents} = 100{,}000{,}000\text{ micro-cents}$). No rounding or truncation is applied at write time.
+  - Rollups **sum exact micro-cents first, then round once at the presentation boundary** using **round-half-up** (the accounting standard). Intermediate values are never rounded and then summed — that accumulates drift and will mismatch PROBE 5's exact totals.
+  - The API returns all three representations so callers can validate: `micro_cents` (exact integer, authoritative), `cents` (round-half-up of the *total*, as a decimal, derived), and `formatted` (display string, derived). Only `micro_cents` is billing truth.
+  - `cents` and `formatted` are computed on read and never persisted as billing truth.
 - **Pinned Rates (`config/pricing.json`)**:
   - Standard Input: $2.00 / 1M tokens ($200\text{ cents} / 1\text{M} = 200\text{ micro-cents/token}$)
   - Cached Input: $0.50 / 1M tokens ($50\text{ cents} / 1\text{M} = 50\text{ micro-cents/token}$, 75% discount)
@@ -206,7 +233,8 @@ erDiagram
   - Event Handlers:
     - `checkout.session.completed`: Sets tenant's plan to `pro`, status to `active`, records Stripe customer & subscription IDs.
     - `customer.subscription.updated`: Updates subscription status (`active`, `past_due`, etc.).
-    - `customer.subscription.deleted`: Reverts tenant to `free` plan.
+    - `customer.subscription.deleted`: Reverts tenant to `free` plan and clears Stripe subscription IDs.
+  - **Ordering & Upsert**: Stripe does not guarantee delivery order. Handlers **upsert** rather than assume a prior event created the row, so a `customer.subscription.updated` arriving before `checkout.session.completed` is applied rather than dropped. Plan identity is resolved from the event's Stripe price ID against `plans.stripe_price_id`; the tenant is resolved from the stored customer/subscription mapping, or from `client_reference_id` when present. The checkout session persists `stripe_customer_id` before redirect so later subscription events can always resolve their tenant.
 
 ### 5.5 Background Job: Stripe Reconciliation & Quota Alerts
 - **Worker Script / Background Task**: `src/workers/reconciliation.py`.
@@ -214,6 +242,56 @@ erDiagram
   1. **Reconciliation**: Periodically queries tenants with active Stripe subscriptions, calls Stripe API to cross-verify subscription state, and reconciles any discrepancies caused by missed webhooks.
   2. **Quota Alerting**: Checks current cycle usage against plan limits. Emits structured log alerts at $\ge 80\%$ and $\ge 100\%$ thresholds.
   3. **Resilience**: Implements exponential backoff retries on network failures and logs failure alerts if retries are exhausted.
+- **Execution Model (Hybrid)**: The worker is both runnable standalone and self-scheduling:
+  - **Standalone (A)**: `python -m src.workers.reconciliation` runs one full pass and exits, so it can be driven by cron, a supervisor, or the evaluator directly. This is the canonical entry point referenced by `capstone.yaml`.
+  - **Embedded (B)**: When `WORKER_ENABLED=true`, the FastAPI lifespan starts an APScheduler job that invokes the same pass on a fixed interval (default 15 min), so a single `run:` command boots both API and worker.
+  - Both paths call the identical `run_once()` function; there is no duplicated logic. The embedded scheduler is disabled by default in tests to keep them deterministic.
+
+---
+
+### 5.6 Billing Period Windows
+"Monthly" is resolved differently by plan, because the two plans have different sources of truth:
+
+- **Free plan**: the window is the **calendar month** in UTC - `[first day 00:00:00Z, first day of next month 00:00:00Z)`. No Stripe object governs a Free tenant's cycle.
+- **Paid plan (Pro)**: the window is the **Stripe billing period** - `[current_period_start, current_period_end)` from the subscription record, refreshed by `customer.subscription.updated`. This is the period the customer is actually invoiced for.
+
+**Rules:**
+- A usage event is attributed to the window in effect **at the moment it is recorded**. Usage is never retroactively re-bucketed.
+- On a Free to Pro upgrade, the new Stripe period begins fresh; the partial calendar-month usage already recorded on Free does not carry into the Pro period's counters and is not prorated (proration is a declared non-goal).
+- On a Pro to Free downgrade, the tenant re-enters the calendar-month window; usage already accumulated in the current calendar month counts, so a downgraded tenant may immediately be at or near its Free quota.
+- If a paid subscription's `current_period_end` has passed and no `customer.subscription.updated` refreshed it, the reconciliation worker re-fetches the subscription from Stripe; until it does, the last known period is used and the discrepancy is logged.
+
+### 5.7 Standardized Error Envelope
+Every error response, on every endpoint, uses one shape. No endpoint returns a bare string or an ad-hoc object.
+
+```json
+{
+  "error": {
+    "code": "quota_exceeded",
+    "message": "Human-readable explanation.",
+    "details": { }
+  }
+}
+```
+
+- `code`: stable machine-readable snake_case identifier (e.g. `quota_exceeded`, `payment_required`, `invalid_signature`, `missing_idempotency_key`, `idempotency_key_reuse`, `validation_error`).
+- `message`: human-readable, safe to display.
+- `details`: optional object with context (metric, current_usage, limit, plan, field errors). Omitted when empty.
+
+**Status mapping:**
+
+| Situation | Status | `code` |
+|---|---|---|
+| Missing/invalid `Idempotency-Key` header | `400` | `missing_idempotency_key` |
+| Same key, different payload | `400` | `idempotency_key_reuse` |
+| Request body fails schema validation | `422` | `validation_error` |
+| Subscription not in good standing | `402` | `payment_required` |
+| Healthy account over quota | `429` | `quota_exceeded` |
+| Webhook signature invalid/missing | `400` | `invalid_signature` |
+| Webhook payload unparseable | `400` | `invalid_payload` |
+| Unexpected server fault | `500` | `internal_error` (generic message; no stack traces or secrets leaked) |
+
+The global exception handlers in `src/api/error_handlers.py` guarantee this shape, including for framework-raised validation errors (FastAPI's default `422` body is remapped into the envelope).
 
 ---
 
@@ -253,7 +331,7 @@ erDiagram
     },
     "cost": {
       "micro_cents": 625000,
-      "cents": 0.625,
+      "cents": 1,
       "formatted": "$0.00625"
     }
   }
@@ -264,10 +342,16 @@ erDiagram
     "error": {
       "code": "quota_exceeded",
       "message": "Monthly API call limit reached for Free plan (1000/1000). Upgrade to Pro to continue.",
-      "metric": "api_calls",
-      "current_usage": 1000,
-      "limit": 1000,
-      "plan": "free"
+      "details": {
+        "metric": "api_calls",
+        "current_usage": 1000,
+        "requested": 1,
+        "limit": 1000,
+        "plan": "free",
+        "upgrade_required": true,
+        "upgrade_plan": "pro",
+        "retry_after_seconds": 1728000
+      }
     }
   }
   ```
@@ -304,8 +388,8 @@ erDiagram
     },
     "cost": {
       "token_cost_micro_cents": 51250000,
-      "token_cost_cents": 51,
-      "base_subscription_cents": 2900,
+      "base_subscription_micro_cents": 2900000000,
+      "total_micro_cents": 2951250000,
       "total_cents": 2951,
       "formatted": "$29.51"
     }
@@ -333,7 +417,7 @@ erDiagram
 - **Body**: Raw binary Stripe event payload.
 - **Responses**:
   - `200 OK`: `{"status": "success", "event_id": "evt_..."}` or `{"status": "ignored", "reason": "duplicate_event"}`
-  - `400 Bad Request`: `{"error": "Invalid signature"}` or `{"error": "Invalid payload"}`
+  - `400 Bad Request`: `{"error": {"code": "invalid_signature", "message": "Webhook signature verification failed."}}` or `{"error": {"code": "invalid_payload", "message": "Webhook payload could not be parsed."}}`
 
 ---
 
