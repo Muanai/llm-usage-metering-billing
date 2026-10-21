@@ -97,8 +97,9 @@ class IdempotencyKey(Base):
     idempotency_key = Column(String(255), nullable=False)
     request_path = Column(String(255), nullable=False)
     request_hash = Column(String(64), nullable=False)  # SHA-256
-    response_status_code = Column(Integer, nullable=False)
-    response_body = Column(Text, nullable=False)
+    response_status_code = Column(Integer, nullable=True)
+    response_body = Column(Text, nullable=True)
+    status = Column(String(32), default="processing", nullable=False)  # processing, completed
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=True)
 
