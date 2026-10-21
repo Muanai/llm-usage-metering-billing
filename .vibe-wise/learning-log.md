@@ -44,3 +44,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Built `src/core/quota.py` with strict precedence (`past_due` $\rightarrow$ 402 before quota volume checks $\rightarrow$ 429), dynamic cycle aggregation over indexed `usage_events`, and dialect-aware pessimistic locking (`with_for_update()`).
 - **Trade-off:** Dynamic aggregation avoids counter drift while composite index `(tenant_id, created_at)` keeps query latency sub-millisecond.
 - **Key Pattern:** Financial-First Precedence & Dynamic Range Aggregation.
+
+### [2026-10-21] Task 6: API Layer Metering & Rollup Endpoints
+- **Decision:** Implemented `POST /api/v1/generate` and `GET /api/v1/tenants/{tenant_id}/usage` with global error handlers translating missing headers and validation issues into clean standardized JSON envelopes (`{"error": {"code", "message", "details"}}`).
+- **Trade-off:** Intercepting FastAPI's default 422 errors into clean 400 Bad Request error envelopes provides consistent machine-parsable responses satisfying Shared Requirement #2.
+- **Key Pattern:** Global Exception Mapping & Uniform Error Envelopes.
