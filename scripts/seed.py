@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from config.settings import settings
-from src.db.models import Tenant, Plan, Subscription, UsageEvent, IdempotencyKey
+from src.db.models import Tenant, Plan, Subscription, UsageEvent, IdempotencyKey, WebhookEvent
 from src.db.session import AsyncSessionLocal, init_db
 
 logger = logging.getLogger("seeder")
@@ -212,6 +212,8 @@ async def run_seed(db: AsyncSession, stripe_client=None) -> None:
                 **ev
             ))
 
+    # Also clear processed webhook events so test runs start fresh
+    await db.execute(delete(WebhookEvent))
     await db.commit()
     logger.info("Successfully seeded plans and 5 deterministic fixtures.")
 

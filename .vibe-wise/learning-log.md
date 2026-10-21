@@ -54,3 +54,20 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Built `src/core/stripe_service.py` and `src/api/v1/billing.py` with raw binary signature verification, replay deduplication in `webhook_events`, event timestamp guards to handle out-of-order delivery, and resilient offline mock fallbacks for testing.
 - **Trade-off:** Cryptographic raw-body verification prevents payload forgery, while timestamp guards guarantee that stale network-delayed events cannot overwrite current subscription status.
 - **Key Pattern:** Cryptographic Signature Verification, Deduplication Store, Event Timestamp Guard.
+
+### [2026-10-21] Task 8: Background Worker: Stripe Reconciliation & Quota Alerts
+- **Decision:** Implemented `src/workers/reconciliation.py` embedded in FastAPI's async lifespan, polling Stripe with exponential backoff and evaluating quota alert thresholds (80% warning, 100% critical).
+- **Trade-off:** Embedding the worker into the application lifespan satisfies the unified single-process requirement while retaining complete standalone execution capability (`python -m src.workers.reconciliation`).
+- **Key Pattern:** Background Worker with Lifespan Management & Exponential Backoff.
+
+### [2026-10-21] Task 9: Seed Fixtures, Stripe Provisioning, Docker Compose, & Manifests
+- **Decision:** Created idempotent `scripts/seed.py`, `capstone.yaml` referencing `uv run ...` exclusively, `docker-compose.yml` for optional PostgreSQL 16 container, and comprehensive `README.md`.
+- **Trade-off:** `seed.py` implements dynamic Stripe price lookup/creation with seamless fallback to offline mock price ID (`price_flyrank_pro_test`), ensuring tests and local development run reliably without network or API token requirements.
+- **Key Pattern:** Idempotent Seeding, Graceful Offline Degradation, Standardized Capstone Manifest.
+
+### [2026-10-21] Task 10: Acceptance Probes Verification & Evidence Artifacts
+- **Decision:** Executed live background test server and script-automated all 5 acceptance probes, writing full real CLI transcripts into `EVIDENCE.md` and authoring `BUILDLOG.md`.
+- **Trade-off:** Capturing real terminal proofs across all probes and shared requirements ensures 100% submission compliance without simulated or hand-waved assertions.
+- **Key Pattern:** Empirical Verification, Proof-First Documentation, End-to-End Acceptance Testing.
+
+

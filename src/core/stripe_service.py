@@ -73,10 +73,15 @@ def verify_webhook_signature(raw_payload: bytes, sig_header: Optional[str]) -> D
     )
 
 
-async def process_webhook_event(db: AsyncSession, event: Dict[str, Any]) -> Dict[str, str]:
+async def process_webhook_event(db: AsyncSession, event: Any) -> Dict[str, str]:
     """
     Idempotently processes verified Stripe webhook events with replay defense and out-of-order guards.
     """
+    if hasattr(event, "to_dict_recursive"):
+        event = event.to_dict_recursive()
+    elif hasattr(event, "to_dict"):
+        event = event.to_dict()
+
     event_id = event["id"]
     event_type = event.get("type", "unknown")
     event_created = event.get("created", 0)
