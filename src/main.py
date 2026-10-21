@@ -7,12 +7,27 @@ from src.api.error_handlers import register_error_handlers
 from src.api.v1.router import api_v1_router
 from src.db.session import init_db
 
+import asyncio
+from src.workers.reconciliation import run_reconciliation_loop
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Auto-initialize tables for zero-friction local/evaluation execution
     await init_db()
+
+    worker_task = None
+    if settings.ENVIRONMENT != "testing":
+        worker_task = asyncio.create_task(run_reconciliation_loop(interval_seconds=60))
+
     yield
-    # Shutdown logic
+
+    # Shutdown: cancel background worker task cleanly
+    if worker_task:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(
     title="LLM Usage Metering & Billing Engine",
