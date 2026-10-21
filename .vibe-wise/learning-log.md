@@ -29,3 +29,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Configured SQLAlchemy 2.0 declarative async models with `greenlet`, auto-table generation on startup (`init_db()`), and an isolated test session fixture with table truncation.
 - **Trade-off:** Chose auto-init on boot over strict migration-only requirement to ensure machine-evaluators running SQLite can boot with zero manual setup steps.
 - **Key Pattern:** Multi-tenancy Data Isolation with composite indexes `(tenant_id, created_at)` and unique constraint on `(tenant_id, idempotency_key)`.
+
+### [2026-10-21] Task 3: Integer Money Math & Token Pricing Calculator (PROBE 5)
+- **Decision:** Built `src/core/calculator.py` using Pydantic `CostBreakdown` and `RollupSummary`, encoding 75% discount for cached input ($0.50/1M), reasoning tokens priced as output ($8.00/1M), and invoice-boundary `ROUND_HALF_UP`.
+- **Trade-off:** Retaining lossless integer micro-cents throughout all operations eliminates float drift, matching PROBE 5 exact expected totals.
+- **Key Pattern:** Exact Integer Arithmetic & Pydantic Data Boundaries.
