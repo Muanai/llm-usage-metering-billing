@@ -34,3 +34,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Built `src/core/calculator.py` using Pydantic `CostBreakdown` and `RollupSummary`, encoding 75% discount for cached input ($0.50/1M), reasoning tokens priced as output ($8.00/1M), and invoice-boundary `ROUND_HALF_UP`.
 - **Trade-off:** Retaining lossless integer micro-cents throughout all operations eliminates float drift, matching PROBE 5 exact expected totals.
 - **Key Pattern:** Exact Integer Arithmetic & Pydantic Data Boundaries.
+
+### [2026-10-21] Task 4: Idempotency Engine & Request Deduplication (PROBE 1)
+- **Decision:** Built `src/core/idempotency.py` using a Two-Phase Reservation pattern (`processing` $\rightarrow$ `completed`) with SHA-256 payload hashing.
+- **Trade-off:** Pre-allocating the key before running business logic prevents race conditions and duplicate work when concurrent clients fire the same idempotency key simultaneously.
+- **Key Pattern:** Two-Phase Idempotency Reservation & SHA-256 Request Integrity Check.
