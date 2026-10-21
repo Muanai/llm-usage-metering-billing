@@ -199,3 +199,47 @@ endpoints:
   checkout: POST /api/v1/billing/checkout
   webhook: POST /api/v1/billing/webhooks/stripe
 ```
+
+---
+
+## 8. High-Concurrency Stress Benchmark & Quantitative Portfolio Metrics
+
+To rigorously validate quota boundary honesty and latency under lock contention, the repository includes an automated benchmark harness ([scripts/benchmark.py](file:///c:/Workspace/projects/swe/llm-usage-metering-billing/scripts/benchmark.py)) and concurrency regression test ([tests/test_benchmark.py](file:///c:/Workspace/projects/swe/llm-usage-metering-billing/tests/test_benchmark.py)).
+
+### Concurrency Stress Test Architecture
+- **Boundary Scenario**: Pre-seeds a tenant to **995 / 1,000 API calls** (leaving exactly 5 calls of headroom).
+- **Concurrent Burst**: Fires **50 simultaneous async requests** through the metering gateway (`POST /api/v1/generate`).
+- **Zero-Leakage Invariant**: Must admit **exactly 5 requests (200 OK)** and reject **exactly 45 requests (429 Too Many Requests)**, with the final database count reaching exactly 1,000 / 1,000 (0 over-allocation leakage).
+
+### Execution Command
+```bash
+uv run python scripts/benchmark.py
+```
+
+### Empirical Benchmark Results
+```
+================================================================================
+CONCURRENCY & QUOTA BOUNDARY INTEGRITY BENCHMARK RESULTS
+================================================================================
+Total Completed Requests:  50 in 1.276s
+Throughput:                39.2 req/sec
+Admitted (200 OK):         5 (Expected: 5)
+Rejected (429 Quota):      45 (Expected: 45)
+Other / Errors:            0
+Final DB Usage Total:      1000 / 1000 calls
+Over-Quota Leaks:          0 (ZERO LEAKAGE CONFIRMED: True)
+--------------------------------------------------------------------------------
+
+LATENCY PERCENTILES (ms):
+Category           |      Min |      p50 |      p90 |      p95 |      p99 |      Max |      Avg
+--------------------------------------------------------------------------------
+All Requests       |    90.88 |   632.46 |  1085.10 |  1150.01 |  1200.59 |  1210.73 |   644.60
+Admitted (200)     |    90.88 |   151.35 |   191.54 |   195.28 |   198.28 |   199.03 |   148.11
+Rejected (429)     |   219.39 |   697.06 |  1094.80 |  1161.52 |  1201.63 |  1210.73 |   699.77
+================================================================================
+```
+
+### Quantitative Portfolio Descriptions (Google XYZ Resume Format)
+- **Engineered a high-integrity LLM usage metering engine** achieving **100% quota boundary honesty (0 over-allocation leaks)** under 50-worker concurrent race conditions using dialect-aware pessimistic row locking and striped in-process mutexes.
+- **Sustained 39.2 req/sec throughput** with an admitted median latency of **151.4ms** and p99 latency of **198.3ms** while atomically executing SHA-256 idempotency deduplication and dynamic cycle rollups.
+- **Architected lossless integer micro-cent billing math** ($1\text{ USD} = 100\text{M } \mu\text{c}$) eliminating IEEE-754 floating-point financial drift across multi-million simulated token volumes.

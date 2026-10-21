@@ -1,3 +1,5 @@
+import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
@@ -5,6 +7,13 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models import Tenant, Subscription, Plan, UsageEvent
+
+# Per-tenant in-process lock striping for concurrency serialization
+_tenant_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+def get_tenant_lock(tenant_id: str) -> asyncio.Lock:
+    """Returns an asyncio.Lock striped by tenant_id for in-process concurrency serialization."""
+    return _tenant_locks[tenant_id]
 
 class QuotaDecision(str, Enum):
     ALLOWED = "allowed"
