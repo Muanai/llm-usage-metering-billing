@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from config.settings import settings
-from src.db.models import Tenant, Subscription, WebhookEvent
+from src.db.models import Tenant, Plan, Subscription, WebhookEvent
 
 # Configure Stripe SDK
 stripe.api_key = settings.STRIPE_SECRET_KEY

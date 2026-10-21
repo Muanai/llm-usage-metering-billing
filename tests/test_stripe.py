@@ -139,3 +139,29 @@ async def test_webhook_subscription_updated_and_deleted(async_client, db_session
 
         await db_session.refresh(sub)
         assert sub.plan_id == "free"
+
+@pytest.mark.asyncio
+async def test_create_checkout_session_live_path_resolves_plan(db_session, monkeypatch):
+    from src.core.stripe_service import create_checkout_session
+    from unittest.mock import MagicMock
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "STRIPE_SECRET_KEY", "sk_test_real_simulated_key")
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+
+    plan = Plan(id="pro_live", name="Pro Live", monthly_api_limit=50000, monthly_token_limit=5000000, base_price_cents=2900, stripe_price_id="price_live_123")
+    tenant = Tenant(id="tenant_live_checkout", name="Live Org", email="live@example.com")
+    db_session.add_all([plan, tenant])
+    await db_session.commit()
+
+    mock_session = MagicMock()
+    mock_session.url = "https://checkout.stripe.com/pay/live_session"
+    mock_session.id = "cs_live_123"
+
+    with patch("stripe.checkout.Session.create", return_value=mock_session) as mock_create:
+        res = await create_checkout_session(db_session, "tenant_live_checkout", "pro_live")
+        assert res["session_id"] == "cs_live_123"
+        mock_create.assert_called_once()
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["line_items"][0]["price"] == "price_live_123"
+
