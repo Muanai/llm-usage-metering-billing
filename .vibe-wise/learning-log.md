@@ -24,3 +24,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Migrated package and environment management to `uv` (`pyproject.toml` + `uv.lock`) while compiling a synchronous `requirements.txt` for legacy environments.
 - **Trade-off:** Modern `uv` tooling provides lightning-fast deterministic builds (<2s) and eliminates global pip environment pollution.
 - **Key Pattern:** Resilient Settings Defaulting (Pydantic-Settings with auto-fallback to SQLite).
+
+### [2026-10-21] Task 2: Persistence Layer & Domain Models
+- **Decision:** Configured SQLAlchemy 2.0 declarative async models with `greenlet`, auto-table generation on startup (`init_db()`), and an isolated test session fixture with table truncation.
+- **Trade-off:** Chose auto-init on boot over strict migration-only requirement to ensure machine-evaluators running SQLite can boot with zero manual setup steps.
+- **Key Pattern:** Multi-tenancy Data Isolation with composite indexes `(tenant_id, created_at)` and unique constraint on `(tenant_id, idempotency_key)`.
