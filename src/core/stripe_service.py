@@ -32,14 +32,18 @@ async def create_checkout_session(
             "session_id": mock_session_id
         }
 
+    # Resolve price ID from plan or settings
+    plan_res = await db.execute(select(Plan).where(Plan.id == plan_id))
+    plan = plan_res.scalar_one_or_none()
+    price_id = (plan.stripe_price_id if plan and plan.stripe_price_id else settings.STRIPE_PRO_PRICE_ID)
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
-            payment_method_types=["card"],
             client_reference_id=tenant_id,
             metadata={"tenant_id": tenant_id, "plan_id": plan_id},
             line_items=[{
-                "price": settings.STRIPE_PRO_PRICE_ID,
+                "price": price_id,
                 "quantity": 1
             }],
             success_url=f"http://{settings.HOST}:{settings.PORT}/api/v1/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
