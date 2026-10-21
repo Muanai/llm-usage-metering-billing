@@ -1,0 +1,35 @@
+{
+  "currency": "USD",
+  "micro_cents_per_cent": 1000000,
+  "rates_per_million_tokens_cents": {
+    "standard_input": 200,
+    "cached_input": 50,
+    "standard_output": 800,
+    "reasoning_output": 800
+  },
+  "rates_per_token_micro_cents": {
+    "standard_input": 200,
+    "cached_input": 50,
+    "standard_output": 800,
+    "reasoning_output": 800
+  },
+  "rates": {
+    "api_call_marginal_cost_micro_cents": 0
+  },
+  "plans": {
+    "free": {
+      "id": "free",
+      "name": "Free Plan",
+      "quota_api_calls": 1000,
+      "quota_tokens": 100000,
+      "base_price_cents": 0
+    },
+    "pro": {
+      "id": "pro",
+      "name": "Pro Plan",
+      "quota_api_calls": 50000,
+      "quota_tokens": 5000000,
+      "base_price_cents": 2900
+    }
+  }
+}
