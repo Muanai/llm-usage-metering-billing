@@ -39,3 +39,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Built `src/core/idempotency.py` using a Two-Phase Reservation pattern (`processing` $\rightarrow$ `completed`) with SHA-256 payload hashing.
 - **Trade-off:** Pre-allocating the key before running business logic prevents race conditions and duplicate work when concurrent clients fire the same idempotency key simultaneously.
 - **Key Pattern:** Two-Phase Idempotency Reservation & SHA-256 Request Integrity Check.
+
+### [2026-10-21] Task 5: Quota Enforcement & Boundary Concurrency (PROBE 2)
+- **Decision:** Built `src/core/quota.py` with strict precedence (`past_due` $\rightarrow$ 402 before quota volume checks $\rightarrow$ 429), dynamic cycle aggregation over indexed `usage_events`, and dialect-aware pessimistic locking (`with_for_update()`).
+- **Trade-off:** Dynamic aggregation avoids counter drift while composite index `(tenant_id, created_at)` keeps query latency sub-millisecond.
+- **Key Pattern:** Financial-First Precedence & Dynamic Range Aggregation.
