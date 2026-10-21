@@ -8,8 +8,11 @@ if str(BASE_DIR) not in sys.path:
 
 import pytest
 import pytest_asyncio
+from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from src.db.models import Base
+from src.main import app
+from src.db.session import get_db
 
 TEST_DB_URL = "sqlite+aiosqlite:///./data/test.db"
 
@@ -37,3 +40,14 @@ async def db_session(test_engine):
         async with test_engine.begin() as conn:
             for table in reversed(Base.metadata.sorted_tables):
                 await conn.execute(table.delete())
+
+@pytest_asyncio.fixture(scope="function")
+async def async_client(db_session):
+    """Provides an HTTPX AsyncClient configured with test database session overrides."""
+    async def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+    app.dependency_overrides.clear()
