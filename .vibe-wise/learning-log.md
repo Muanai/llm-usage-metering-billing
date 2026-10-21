@@ -49,3 +49,8 @@ This log documents system design decisions, edge-case resolutions, and architect
 - **Decision:** Implemented `POST /api/v1/generate` and `GET /api/v1/tenants/{tenant_id}/usage` with global error handlers translating missing headers and validation issues into clean standardized JSON envelopes (`{"error": {"code", "message", "details"}}`).
 - **Trade-off:** Intercepting FastAPI's default 422 errors into clean 400 Bad Request error envelopes provides consistent machine-parsable responses satisfying Shared Requirement #2.
 - **Key Pattern:** Global Exception Mapping & Uniform Error Envelopes.
+
+### [2026-10-21] Task 7: Stripe Integration & Webhooks (PROBE 3 & PROBE 4)
+- **Decision:** Built `src/core/stripe_service.py` and `src/api/v1/billing.py` with raw binary signature verification, replay deduplication in `webhook_events`, event timestamp guards to handle out-of-order delivery, and resilient offline mock fallbacks for testing.
+- **Trade-off:** Cryptographic raw-body verification prevents payload forgery, while timestamp guards guarantee that stale network-delayed events cannot overwrite current subscription status.
+- **Key Pattern:** Cryptographic Signature Verification, Deduplication Store, Event Timestamp Guard.
