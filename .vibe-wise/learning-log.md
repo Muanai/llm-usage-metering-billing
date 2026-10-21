@@ -19,3 +19,8 @@ This log documents system design decisions, edge-case resolutions, and architect
   5. Webhook upsert with event timestamp guards to handle out-of-order Stripe deliveries safely.
 - **Trade-off:** Pre-execution locking introduces slight serialization per tenant, but guarantees 100% ACID correctness and zero over-quota leaks.
 - **Key Pattern:** Pessimistic Row Locking, Idempotency Token Replay, Event Upserting.
+
+### [2026-10-21] Task 1: Environment Configuration & Tooling Migration
+- **Decision:** Migrated package and environment management to `uv` (`pyproject.toml` + `uv.lock`) while compiling a synchronous `requirements.txt` for legacy environments.
+- **Trade-off:** Modern `uv` tooling provides lightning-fast deterministic builds (<2s) and eliminates global pip environment pollution.
+- **Key Pattern:** Resilient Settings Defaulting (Pydantic-Settings with auto-fallback to SQLite).
