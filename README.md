@@ -11,7 +11,7 @@ The engine is built as a **Unified Single Service** adhering strictly to a singl
 ```mermaid
 graph TD
     Client[Client / Evaluator / AI Consumer] -->|POST /api/v1/generate| Meter[API: Meter & Quotas]
-    Client -->|GET /api/v1/tenants/{id}/usage| Usage[API: Rollup Engine]
+    Client -->|GET /api/v1/tenants/:id/usage| Usage[API: Rollup Engine]
     Client -->|POST /api/v1/billing/checkout| Checkout[API: Stripe Checkout]
     Stripe[Stripe / Stripe Webhooks] -->|POST /api/v1/billing/webhooks/stripe| Webhook[API: Webhook Handler]
 
